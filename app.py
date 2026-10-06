@@ -73,7 +73,7 @@ def start():
     data = request.json
     path = data.get("path", "").strip()
     recursive = data.get("recursive", False)
-    workers = data.get("workers", 3)
+    workers = 3  # Fijo a 3 hilos concurrentes para estabilidad óptima con la API de Movistar
     
     jsid = data.get("jsessionid", "").strip()
     vkey = data.get("validationkey", "").strip()
@@ -104,7 +104,14 @@ def start():
 def stop():
     global UPLOAD_PROCESS, UPLOAD_LOGS
     if UPLOAD_PROCESS is not None:
-        UPLOAD_PROCESS.terminate()
+        try:
+            UPLOAD_PROCESS.terminate()
+            UPLOAD_PROCESS.wait(timeout=2)
+        except Exception:
+            try:
+                UPLOAD_PROCESS.kill()
+            except Exception:
+                pass
         UPLOAD_LOGS.append("--- Proceso abortado por el usuario ---")
         UPLOAD_PROCESS = None
         return jsonify({"status": "ok"})
@@ -112,7 +119,7 @@ def stop():
 
 @app.route("/logs", methods=["GET"])
 def logs():
-    return jsonify({"logs": UPLOAD_LOGS, "running": UPLOAD_PROCESS is not None})
+    return jsonify({"logs": UPLOAD_LOGS, "is_running": UPLOAD_PROCESS is not None, "running": UPLOAD_PROCESS is not None})
 
 @app.route("/folders", methods=["GET"])
 def get_folders():

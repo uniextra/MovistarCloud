@@ -382,10 +382,14 @@ def main() -> int:
                     mc.wait_usable(file_id)
                 return "ok"
             except requests.exceptions.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 401:
-                    logger.error(f"{progress_prefix} [CRÍTICO] Sesión caducada (Error 401). Abortando proceso de inmediato.")
-                    import os
-                    os._exit(1)
+                if exc.response is not None:
+                    if exc.response.status_code == 401:
+                        logger.error(f"{progress_prefix} [CRÍTICO] Sesión caducada (Error 401). Abortando proceso de inmediato.")
+                        import os
+                        os._exit(1)
+                    elif exc.response.status_code == 405:
+                        logger.error(f"{progress_prefix} [ERROR 405] La API de Movistar rechazó la petición concurrente. Esperando 1s...")
+                        time.sleep(1)
                 logger.error(f"{progress_prefix} [ERROR] Falló la subida HTTP: {exc}")
                 return "error"
             except Exception as exc:
