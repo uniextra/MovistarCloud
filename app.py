@@ -11,6 +11,7 @@ ensure_vnc_services()
 app = Flask(__name__)
 
 # Configuración y estado global
+UPLOAD_LOCK = threading.Lock()
 UPLOAD_PROCESS = None
 UPLOAD_LOGS = []
 LOGIN_PROCESS = None
@@ -55,23 +56,9 @@ def kill_process_tree(proc):
     except Exception as e:
         app.logger.error(f"Error terminando proceso: {e}")
 
-def background_upload(cmd, env_vars):
+def read_upload_logs(proc):
     global UPLOAD_PROCESS, UPLOAD_LOGS
-    UPLOAD_LOGS.clear()
-    UPLOAD_LOGS.append(f"$ {' '.join(cmd)}")
-    
-    proc = None
     try:
-        proc = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT, 
-            text=True,
-            bufsize=1,
-            env=env_vars,
-            start_new_session=True
-        )
-        UPLOAD_PROCESS = proc
         for line in proc.stdout:
             UPLOAD_LOGS.append(line.rstrip())
             if len(UPLOAD_LOGS) > 500:
@@ -81,7 +68,9 @@ def background_upload(cmd, env_vars):
     except Exception as e:
         UPLOAD_LOGS.append(f"Error en proceso: {str(e)}")
     finally:
-        UPLOAD_PROCESS = None
+        with UPLOAD_LOCK:
+            if UPLOAD_PROCESS == proc:
+                UPLOAD_PROCESS = None
 
 def get_env_vars():
     env_vars = os.environ.copy()
@@ -110,53 +99,73 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start():
-    global UPLOAD_PROCESS
-    if UPLOAD_PROCESS is not None and UPLOAD_PROCESS.poll() is None:
-        return jsonify({"status": "error", "message": "Ya hay una subida en curso"}), 400
+    global UPLOAD_PROCESS, UPLOAD_LOGS
+    with UPLOAD_LOCK:
+        if UPLOAD_PROCESS is not None and UPLOAD_PROCESS.poll() is None:
+            return jsonify({"status": "error", "message": "Ya hay una subida en curso"}), 400
 
-    data = request.json
-    path = data.get("path", "").strip()
-    recursive = data.get("recursive", False)
-    workers = 3  # Fijo a 3 hilos concurrentes para estabilidad óptima con la API de Movistar
-    
-    jsid = data.get("jsessionid", "").strip()
-    vkey = data.get("validationkey", "").strip()
+        data = request.json
+        path = data.get("path", "").strip()
+        recursive = data.get("recursive", False)
+        workers = 3  # Fijo a 3 hilos concurrentes para estabilidad óptima con la API de Movistar
+        
+        jsid = data.get("jsessionid", "").strip()
+        vkey = data.get("validationkey", "").strip()
 
-    takeout = data.get("takeout", False)
+        takeout = data.get("takeout", False)
 
-    if not path:
-        return jsonify({"status": "error", "message": "La ruta no puede estar vacía"}), 400
-    if not jsid or not vkey:
-        return jsonify({"status": "error", "message": "Faltan las cookies de sesión"}), 400
+        if not path:
+            return jsonify({"status": "error", "message": "La ruta no puede estar vacía"}), 400
+        if not jsid or not vkey:
+            return jsonify({"status": "error", "message": "Faltan las cookies de sesión"}), 400
 
-    save_env_vars(jsid, vkey)
-    env_vars = get_env_vars()
+        save_env_vars(jsid, vkey)
+        env_vars = get_env_vars()
 
-    cmd = ["python", "-u", "/app/movistar_cloud_gallery.py", path, "--workers", str(workers)]
-    if recursive:
-        cmd.append("--recursive")
-    if takeout:
-        cmd.append("--takeout")
+        cmd = ["python", "-u", "/app/movistar_cloud_gallery.py", path, "--workers", str(workers)]
+        if recursive:
+            cmd.append("--recursive")
+        if takeout:
+            cmd.append("--takeout")
 
-    thread = threading.Thread(target=background_upload, args=(cmd, env_vars))
-    thread.daemon = True
-    thread.start()
+        UPLOAD_LOGS.clear()
+        UPLOAD_LOGS.append(f"$ {' '.join(cmd)}")
 
-    return jsonify({"status": "ok", "message": "Subida iniciada"})
+        try:
+            proc = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True,
+                bufsize=1,
+                env=env_vars,
+                start_new_session=True
+            )
+            UPLOAD_PROCESS = proc
+        except Exception as e:
+            UPLOAD_LOGS.append(f"Error al iniciar proceso: {e}")
+            return jsonify({"status": "error", "message": f"Error al iniciar proceso: {e}"}), 500
+
+        thread = threading.Thread(target=read_upload_logs, args=(proc,))
+        thread.daemon = True
+        thread.start()
+
+        return jsonify({"status": "ok", "message": "Subida iniciada"})
 
 @app.route("/stop", methods=["POST"])
 def stop():
     global UPLOAD_PROCESS, UPLOAD_LOGS
-    proc = UPLOAD_PROCESS
-    if proc is not None and proc.poll() is None:
-        UPLOAD_LOGS.append("--- Cancelando subida por el usuario... ---")
-        kill_process_tree(proc)
-        UPLOAD_LOGS.append("--- Proceso abortado por el usuario ---")
-        UPLOAD_PROCESS = None
-        return jsonify({"status": "ok", "message": "Proceso detenido con éxito"})
-    else:
-        UPLOAD_PROCESS = None
-        return jsonify({"status": "ok", "message": "No hay proceso activo"})
+    with UPLOAD_LOCK:
+        proc = UPLOAD_PROCESS
+        if proc is not None and proc.poll() is None:
+            UPLOAD_LOGS.append("--- Cancelando subida por el usuario... ---")
+            kill_process_tree(proc)
+            UPLOAD_LOGS.append("--- Proceso abortado por el usuario ---")
+            UPLOAD_PROCESS = None
+            return jsonify({"status": "ok", "message": "Proceso detenido con éxito"})
+        else:
+            UPLOAD_PROCESS = None
+            return jsonify({"status": "ok", "message": "No hay proceso activo"})
 
 @app.route("/logs", methods=["GET"])
 def logs():

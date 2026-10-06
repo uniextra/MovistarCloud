@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import logging
 import mimetypes
@@ -10,6 +11,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 import hashlib
@@ -24,10 +26,15 @@ try:
 except ImportError:
     Image = None
 
+_GLOBAL_CACHE = None
+
 # Manejador de señal para terminación inmediata y limpia en caso de SIGTERM / SIGINT
 def handle_sigterm(signum, frame):
     try:
-        logging.getLogger("MovistarGallery").info("Señal de parada recibida (SIGTERM/SIGINT). Saliendo inmediatamente...")
+        logging.getLogger("MovistarGallery").info("Señal de parada recibida (SIGTERM/SIGINT). Saliendo limpiamente...")
+        global _GLOBAL_CACHE
+        if _GLOBAL_CACHE is not None:
+            _GLOBAL_CACHE.close()
     except Exception:
         pass
     os._exit(0)
@@ -42,116 +49,246 @@ class UploadCache:
     """
     Base de datos SQLite persistente para garantizar que ninguna foto o vídeo
     se vuelva a subir por duplicado, incluso tras reiniciar Docker o detener el proceso.
+    Incluye sincronización con mutex (threading.RLock), modo WAL con fallback,
+    timeout extendido (30s), busy timeout y reintentos ante bloqueos de filesystem/red.
     """
     def __init__(self, db_path: Path):
         self.db_path = db_path
+        self._lock = threading.RLock()
+        self._conn = None
         self._init_db()
 
-    def _get_conn(self):
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+    def _open_connection(self, path: Path, timeout: float = 30.0) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            str(path),
+            timeout=timeout,
+            check_same_thread=False
+        )
         conn.row_factory = sqlite3.Row
+        
+        # Configuración de SQLite para máxima concurrencia y tolerancia a bloqueos
+        busy_ms = int(timeout * 1000)
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {busy_ms};")
+        except Exception:
+            pass
+
+        try:
+            # Modo WAL permite lecturas y escrituras concurrentes sin bloqueos de archivo
+            res = conn.execute("PRAGMA journal_mode = WAL;").fetchone()
+            mode = str(res[0]).upper() if res else ""
+            if mode != "WAL":
+                try:
+                    conn.execute("PRAGMA journal_mode = DELETE;")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            conn.execute("PRAGMA synchronous = NORMAL;")
+        except Exception:
+            pass
+
         return conn
 
-    def _init_db(self):
-        try:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = self._get_conn()
+    def _get_conn(self, timeout: float = 30.0) -> sqlite3.Connection:
+        if self._conn is not None:
             try:
-                with conn:
-                    conn.execute("""
-                        CREATE TABLE IF NOT EXISTS uploaded_files (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            file_path TEXT NOT NULL,
-                            file_name TEXT NOT NULL,
-                            file_size INTEGER NOT NULL,
-                            mtime REAL NOT NULL,
-                            cloud_id INTEGER,
-                            uploaded_at TEXT NOT NULL,
-                            status TEXT NOT NULL,
-                            UNIQUE(file_path, file_size)
-                        )
-                    """)
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
-            finally:
-                conn.close()
-            logging.getLogger("MovistarGallery").info(f"Caché local persistente inicializada en: {self.db_path}")
-        except Exception as e:
-            logging.getLogger("MovistarGallery").warning(f"No se pudo inicializar base de datos de caché en {self.db_path}: {e}")
+                self._conn.execute("SELECT 1;")
+                return self._conn
+            except Exception:
+                self._close_conn()
+        self._conn = self._open_connection(self.db_path, timeout=timeout)
+        return self._conn
+
+    def _close_conn(self):
+        if self._conn is not None:
+            try:
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                except Exception:
+                    pass
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def _init_db(self):
+        with self._lock:
+            attempts = 2
+            last_err = None
+            for attempt in range(attempts):
+                try:
+                    self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                    conn = self._get_conn(timeout=4.0)
+                    with conn:
+                        conn.execute("""
+                            CREATE TABLE IF NOT EXISTS uploaded_files (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                file_path TEXT NOT NULL,
+                                file_name TEXT NOT NULL,
+                                file_size INTEGER NOT NULL,
+                                mtime REAL NOT NULL,
+                                cloud_id INTEGER,
+                                uploaded_at TEXT NOT NULL,
+                                status TEXT NOT NULL,
+                                UNIQUE(file_path, file_size)
+                            )
+                        """)
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
+                    self._close_conn()
+                    logging.getLogger("MovistarGallery").info(f"Caché local persistente inicializada en: {self.db_path}")
+                    return
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                    last_err = e
+                    logging.getLogger("MovistarGallery").warning(
+                        f"Intento {attempt + 1}/{attempts} de inicializar caché en {self.db_path} falló ({e}). Reintentando..."
+                    )
+                    self._close_conn()
+                    time.sleep(1.0)
+                except Exception as e:
+                    last_err = e
+                    logging.getLogger("MovistarGallery").warning(f"Error inesperado inicializando caché en {self.db_path}: {e}")
+                    break
+
+            # Fallback si el montaje de red o Docker bind mount en /data bloquea permanentemente SQLite
+            fallback_candidates = []
+            if Path("/tmp").exists() and os.access(Path("/tmp"), os.W_OK):
+                fallback_candidates.append(Path("/tmp/.movistar_upload_cache.sqlite"))
+            fallback_candidates.append(Path.home() / ".movistar_upload_cache.sqlite")
+
+            for fallback in fallback_candidates:
+                if self.db_path != fallback:
+                    logging.getLogger("MovistarGallery").warning(
+                        f"Activando ruta de caché de respaldo local en: {fallback} debido a bloqueo en {self.db_path} ({last_err})"
+                    )
+                    self.db_path = fallback
+                    self._close_conn()
+                    try:
+                        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                        conn = self._get_conn(timeout=5.0)
+                        with conn:
+                            conn.execute("""
+                                CREATE TABLE IF NOT EXISTS uploaded_files (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    file_path TEXT NOT NULL,
+                                    file_name TEXT NOT NULL,
+                                    file_size INTEGER NOT NULL,
+                                    mtime REAL NOT NULL,
+                                    cloud_id INTEGER,
+                                    uploaded_at TEXT NOT NULL,
+                                    status TEXT NOT NULL,
+                                    UNIQUE(file_path, file_size)
+                                )
+                            """)
+                            conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
+                            conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
+                        self._close_conn()
+                        logging.getLogger("MovistarGallery").info(f"Caché de respaldo inicializada con éxito en: {self.db_path}")
+                        return
+                    except Exception as fb_err:
+                        logging.getLogger("MovistarGallery").warning(f"Fallback {fallback} también falló: {fb_err}")
+                        self._close_conn()
 
     def is_uploaded(self, path: Path) -> bool:
-        try:
-            stat = path.stat()
-            size = stat.st_size
-            name = path.name
-            rel_path = str(path)
-            
-            conn = self._get_conn()
+        with self._lock:
             try:
-                with conn:
-                    # 1. Chequeo por ruta completa y tamaño
-                    cur = conn.execute(
-                        "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok'",
-                        (rel_path, size)
-                    )
-                    if cur.fetchone():
-                        return True
-                    # 2. Chequeo por nombre de archivo y tamaño
-                    cur = conn.execute(
-                        "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok'",
-                        (name, size)
-                    )
-                    if cur.fetchone():
-                        return True
-            finally:
-                conn.close()
-        except Exception as e:
-            logging.getLogger("MovistarGallery").debug(f"Error consultando caché para {path.name}: {e}")
-        return False
+                stat = path.stat()
+                size = stat.st_size
+                name = path.name
+                rel_path = str(path)
+                
+                for attempt in range(3):
+                    try:
+                        conn = self._get_conn()
+                        # 1. Chequeo por ruta completa y tamaño
+                        cur = conn.execute(
+                            "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok' LIMIT 1",
+                            (rel_path, size)
+                        )
+                        if cur.fetchone():
+                            return True
+                        # 2. Chequeo por nombre de archivo y tamaño
+                        cur = conn.execute(
+                            "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok' LIMIT 1",
+                            (name, size)
+                        )
+                        if cur.fetchone():
+                            return True
+                        return False
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() or "busy" in str(e).lower():
+                            time.sleep(0.1 * (attempt + 1))
+                            continue
+                        raise
+            except Exception as e:
+                logging.getLogger("MovistarGallery").debug(f"Error consultando caché para {path.name}: {e}")
+            return False
 
     def mark_uploaded(self, path: Path, cloud_id: int | None = None, status: str = "ok"):
-        try:
-            stat = path.stat()
-            size = stat.st_size
-            name = path.name
-            mtime = stat.st_mtime
-            rel_path = str(path)
-            now = datetime.now(timezone.utc).isoformat()
-            
-            conn = self._get_conn()
+        with self._lock:
             try:
-                with conn:
-                    conn.execute("""
-                        INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(file_path, file_size) DO UPDATE SET
-                            cloud_id = excluded.cloud_id,
-                            uploaded_at = excluded.uploaded_at,
-                            status = excluded.status
-                    """, (rel_path, name, size, mtime, cloud_id, now, status))
-            finally:
-                conn.close()
-        except Exception as e:
-            logging.getLogger("MovistarGallery").warning(f"No se pudo registrar {path.name} en la caché: {e}")
+                stat = path.stat()
+                size = stat.st_size
+                name = path.name
+                mtime = stat.st_mtime
+                rel_path = str(path)
+                now = datetime.now(timezone.utc).isoformat()
+                
+                for attempt in range(3):
+                    try:
+                        conn = self._get_conn()
+                        with conn:
+                            conn.execute("""
+                                INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(file_path, file_size) DO UPDATE SET
+                                    cloud_id = excluded.cloud_id,
+                                    uploaded_at = excluded.uploaded_at,
+                                    status = excluded.status
+                            """, (rel_path, name, size, mtime, cloud_id, now, status))
+                        return
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() or "busy" in str(e).lower():
+                            time.sleep(0.1 * (attempt + 1))
+                            continue
+                        raise
+            except Exception as e:
+                logging.getLogger("MovistarGallery").warning(f"No se pudo registrar {path.name} en la caché: {e}")
 
     def import_cloud_items(self, items_dict: dict):
         if not items_dict:
             return
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            conn = self._get_conn()
+        with self._lock:
             try:
-                with conn:
-                    for (name, size), item in items_dict.items():
-                        cloud_id = item.get("id") if isinstance(item, dict) else None
-                        conn.execute("""
-                            INSERT OR IGNORE INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
-                            VALUES (?, ?, ?, 0, ?, ?, 'ok')
-                        """, (str(name), str(name), int(size), cloud_id, now))
-            finally:
-                conn.close()
-        except Exception as e:
-            logging.getLogger("MovistarGallery").debug(f"Error importando items de nube a la caché: {e}")
+                now = datetime.now(timezone.utc).isoformat()
+                rows = []
+                for (name, size), item in items_dict.items():
+                    cloud_id = item.get("id") if isinstance(item, dict) else None
+                    rows.append((str(name), str(name), int(size), 0.0, cloud_id, now))
+                
+                for attempt in range(3):
+                    try:
+                        conn = self._get_conn()
+                        with conn:
+                            conn.executemany("""
+                                INSERT OR IGNORE INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
+                                VALUES (?, ?, ?, ?, ?, ?, 'ok')
+                            """, rows)
+                        return
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() or "busy" in str(e).lower():
+                            time.sleep(0.2 * (attempt + 1))
+                            continue
+                        raise
+            except Exception as e:
+                logging.getLogger("MovistarGallery").debug(f"Error importando items de nube a la caché: {e}")
+
+    def close(self):
+        with self._lock:
+            self._close_conn()
 
 def get_cache_db_path(target_path: Path) -> Path:
     data_dir = Path("/data")
@@ -506,6 +643,9 @@ def main() -> int:
         # Inicializar base de datos de caché persistente (local al volumen)
         cache_path = get_cache_db_path(path)
         cache = UploadCache(cache_path)
+        global _GLOBAL_CACHE
+        _GLOBAL_CACHE = cache
+        atexit.register(lambda: _GLOBAL_CACHE.close() if _GLOBAL_CACHE else None)
 
         # Obtenemos TODOS los items de galería para detectar duplicados
         existing_items = mc.get_all_gallery_items()
@@ -582,6 +722,8 @@ def main() -> int:
         return 1 if failed else 0
 
     finally:
+        if 'cache' in locals() and cache is not None:
+            cache.close()
         mc.s.close()
 
 
