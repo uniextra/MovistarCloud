@@ -1,8 +1,17 @@
 import time
+import signal
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
-import os
+def handle_sigterm(signum, frame):
+    os._exit(0)
+
+try:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+except Exception:
+    pass
 
 try:
     from vnc_helper import ensure_vnc_services

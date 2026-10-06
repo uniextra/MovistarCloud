@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import threading
 from flask import Flask, render_template, request, jsonify
@@ -15,27 +16,70 @@ UPLOAD_LOGS = []
 LOGIN_PROCESS = None
 ENV_PATH = "/app/.env"
 
+def kill_process_tree(proc):
+    """
+    Termina de forma limpia y forzosa un proceso y todo su grupo/árbol de procesos.
+    Utiliza killpg en Linux/Docker con SIGTERM y escalado a SIGKILL, con fallback para Windows.
+    """
+    if proc is None:
+        return
+    try:
+        pid = proc.pid
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                return
+            try:
+                proc.wait(timeout=2)
+            except (subprocess.TimeoutExpired, Exception):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except (subprocess.TimeoutExpired, Exception):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+    except Exception as e:
+        app.logger.error(f"Error terminando proceso: {e}")
+
 def background_upload(cmd, env_vars):
     global UPLOAD_PROCESS, UPLOAD_LOGS
     UPLOAD_LOGS.clear()
     UPLOAD_LOGS.append(f"$ {' '.join(cmd)}")
     
+    proc = None
     try:
-        UPLOAD_PROCESS = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.STDOUT, 
             text=True,
-            env=env_vars
+            bufsize=1,
+            env=env_vars,
+            start_new_session=True
         )
-        for line in UPLOAD_PROCESS.stdout:
+        UPLOAD_PROCESS = proc
+        for line in proc.stdout:
             UPLOAD_LOGS.append(line.rstrip())
             if len(UPLOAD_LOGS) > 500:
                 UPLOAD_LOGS.pop(0)
-        UPLOAD_PROCESS.wait()
-        UPLOAD_LOGS.append(f"--- Proceso finalizado con código {UPLOAD_PROCESS.returncode} ---")
+        proc.wait()
+        UPLOAD_LOGS.append(f"--- Proceso finalizado con código {proc.returncode} ---")
     except Exception as e:
-        UPLOAD_LOGS.append(f"Error al iniciar: {str(e)}")
+        UPLOAD_LOGS.append(f"Error en proceso: {str(e)}")
     finally:
         UPLOAD_PROCESS = None
 
@@ -67,7 +111,7 @@ def index():
 @app.route("/start", methods=["POST"])
 def start():
     global UPLOAD_PROCESS
-    if UPLOAD_PROCESS is not None:
+    if UPLOAD_PROCESS is not None and UPLOAD_PROCESS.poll() is None:
         return jsonify({"status": "error", "message": "Ya hay una subida en curso"}), 400
 
     data = request.json
@@ -88,7 +132,7 @@ def start():
     save_env_vars(jsid, vkey)
     env_vars = get_env_vars()
 
-    cmd = ["python", "/app/movistar_cloud_gallery.py", path, "--workers", str(workers)]
+    cmd = ["python", "-u", "/app/movistar_cloud_gallery.py", path, "--workers", str(workers)]
     if recursive:
         cmd.append("--recursive")
     if takeout:
@@ -103,23 +147,25 @@ def start():
 @app.route("/stop", methods=["POST"])
 def stop():
     global UPLOAD_PROCESS, UPLOAD_LOGS
-    if UPLOAD_PROCESS is not None:
-        try:
-            UPLOAD_PROCESS.terminate()
-            UPLOAD_PROCESS.wait(timeout=2)
-        except Exception:
-            try:
-                UPLOAD_PROCESS.kill()
-            except Exception:
-                pass
+    proc = UPLOAD_PROCESS
+    if proc is not None and proc.poll() is None:
+        UPLOAD_LOGS.append("--- Cancelando subida por el usuario... ---")
+        kill_process_tree(proc)
         UPLOAD_LOGS.append("--- Proceso abortado por el usuario ---")
         UPLOAD_PROCESS = None
-        return jsonify({"status": "ok"})
-    return jsonify({"status": "error", "message": "No hay proceso en curso"})
+        return jsonify({"status": "ok", "message": "Proceso detenido con éxito"})
+    else:
+        UPLOAD_PROCESS = None
+        return jsonify({"status": "ok", "message": "No hay proceso activo"})
 
 @app.route("/logs", methods=["GET"])
 def logs():
-    return jsonify({"logs": UPLOAD_LOGS, "is_running": UPLOAD_PROCESS is not None, "running": UPLOAD_PROCESS is not None})
+    is_running = UPLOAD_PROCESS is not None and UPLOAD_PROCESS.poll() is None
+    return jsonify({
+        "logs": UPLOAD_LOGS, 
+        "is_running": is_running, 
+        "running": is_running
+    })
 
 @app.route("/folders", methods=["GET"])
 def get_folders():
@@ -160,11 +206,8 @@ def start_login():
 
     # Terminar proceso previo si existe
     if LOGIN_PROCESS is not None and LOGIN_PROCESS.poll() is None:
-        try:
-            LOGIN_PROCESS.terminate()
-            LOGIN_PROCESS.wait(timeout=2)
-        except Exception:
-            LOGIN_PROCESS.kill()
+        kill_process_tree(LOGIN_PROCESS)
+        LOGIN_PROCESS = None
             
     # Limpiar credenciales previas para que la detección sea limpia
     if os.path.exists(ENV_PATH):
@@ -173,20 +216,20 @@ def start_login():
         except Exception:
             pass
 
-    LOGIN_PROCESS = subprocess.Popen(["python", "-u", "/app/movistar_login.py"])
+    LOGIN_PROCESS = subprocess.Popen(
+        ["python", "-u", "/app/movistar_login.py"],
+        start_new_session=True
+    )
     return jsonify({"status": "ok"})
 
 @app.route("/stop_login", methods=["POST"])
 def stop_login():
     global LOGIN_PROCESS
     if LOGIN_PROCESS is not None and LOGIN_PROCESS.poll() is None:
-        try:
-            LOGIN_PROCESS.terminate()
-            LOGIN_PROCESS.wait(timeout=2)
-        except Exception:
-            LOGIN_PROCESS.kill()
+        kill_process_tree(LOGIN_PROCESS)
         LOGIN_PROCESS = None
         return jsonify({"status": "ok", "message": "Login cancelado"})
+    LOGIN_PROCESS = None
     return jsonify({"status": "ok", "message": "No había proceso de login activo"})
 
 @app.route("/env", methods=["GET"])

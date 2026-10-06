@@ -7,6 +7,8 @@ import json
 import logging
 import mimetypes
 import os
+import signal
+import sqlite3
 import sys
 import time
 import uuid
@@ -21,6 +23,132 @@ try:
     from PIL.ExifTags import TAGS
 except ImportError:
     Image = None
+
+# Manejador de señal para terminación inmediata y limpia en caso de SIGTERM / SIGINT
+def handle_sigterm(signum, frame):
+    try:
+        logging.getLogger("MovistarGallery").info("Señal de parada recibida (SIGTERM/SIGINT). Saliendo inmediatamente...")
+    except Exception:
+        pass
+    os._exit(0)
+
+try:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+except Exception:
+    pass
+
+class UploadCache:
+    """
+    Base de datos SQLite persistente para garantizar que ninguna foto o vídeo
+    se vuelva a subir por duplicado, incluso tras reiniciar Docker o detener el proceso.
+    """
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _get_conn(self):
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._get_conn() as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS uploaded_files (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        file_path TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        file_size INTEGER NOT NULL,
+                        mtime REAL NOT NULL,
+                        cloud_id INTEGER,
+                        uploaded_at TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        UNIQUE(file_path, file_size)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
+                conn.commit()
+            logging.getLogger("MovistarGallery").info(f"Caché local persistente inicializada en: {self.db_path}")
+        except Exception as e:
+            logging.getLogger("MovistarGallery").warning(f"No se pudo inicializar base de datos de caché en {self.db_path}: {e}")
+
+    def is_uploaded(self, path: Path) -> bool:
+        try:
+            stat = path.stat()
+            size = stat.st_size
+            name = path.name
+            rel_path = str(path)
+            
+            with self._get_conn() as conn:
+                # 1. Chequeo por ruta completa y tamaño
+                cur = conn.execute(
+                    "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok'",
+                    (rel_path, size)
+                )
+                if cur.fetchone():
+                    return True
+                # 2. Chequeo por nombre de archivo y tamaño
+                cur = conn.execute(
+                    "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok'",
+                    (name, size)
+                )
+                if cur.fetchone():
+                    return True
+        except Exception as e:
+            logging.getLogger("MovistarGallery").debug(f"Error consultando caché para {path.name}: {e}")
+        return False
+
+    def mark_uploaded(self, path: Path, cloud_id: int | None = None, status: str = "ok"):
+        try:
+            stat = path.stat()
+            size = stat.st_size
+            name = path.name
+            mtime = stat.st_mtime
+            rel_path = str(path)
+            now = datetime.now(timezone.utc).isoformat()
+            
+            with self._get_conn() as conn:
+                conn.execute("""
+                    INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(file_path, file_size) DO UPDATE SET
+                        cloud_id = excluded.cloud_id,
+                        uploaded_at = excluded.uploaded_at,
+                        status = excluded.status
+                """, (rel_path, name, size, mtime, cloud_id, now, status))
+                conn.commit()
+        except Exception as e:
+            logging.getLogger("MovistarGallery").warning(f"No se pudo registrar {path.name} en la caché: {e}")
+
+    def import_cloud_items(self, items_dict: dict):
+        if not items_dict:
+            return
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            with self._get_conn() as conn:
+                for (name, size), item in items_dict.items():
+                    cloud_id = item.get("id") if isinstance(item, dict) else None
+                    conn.execute("""
+                        INSERT OR IGNORE INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
+                        VALUES (?, ?, ?, 0, ?, ?, 'ok')
+                    """, (str(name), str(name), int(size), cloud_id, now))
+                conn.commit()
+        except Exception as e:
+            logging.getLogger("MovistarGallery").debug(f"Error importando items de nube a la caché: {e}")
+
+def get_cache_db_path(target_path: Path) -> Path:
+    data_dir = Path("/data")
+    if data_dir.exists() and os.access(data_dir, os.W_OK):
+        return data_dir / ".movistar_upload_cache.sqlite"
+    if target_path.is_dir() and os.access(target_path, os.W_OK):
+        return target_path / ".movistar_upload_cache.sqlite"
+    elif target_path.parent.exists() and os.access(target_path.parent, os.W_OK):
+        return target_path.parent / ".movistar_upload_cache.sqlite"
+    return Path.home() / ".movistar_upload_cache.sqlite"
 
 # ---------------------------------------------------------
 # CONSTANTS & CONFIGURATION
@@ -176,7 +304,7 @@ class MovistarCloud:
         Fetches the complete gallery (pictures & videos) to prevent duplicate uploads.
         Movistar uses pagination/limits. We request up to 50000 items.
         """
-        logger.debug("Obteniendo inventario de la Galería para control de duplicados...")
+        logger.info("Obteniendo inventario de la Galería en Movistar Cloud para control de duplicados...")
         existing_items = {}
         
         for media_type in ["picture", "video"]:
@@ -190,21 +318,29 @@ class MovistarCloud:
             try:
                 r = self.s.post(url, json=payload, timeout=self.timeout)
                 r.raise_for_status()
-                # The response structure has data -> pictures (or videos) depending on the endpoint
-                key = "pictures" if media_type == "picture" else "videos"
-                items = r.json().get("data", {}).get(key, [])
+                data_obj = r.json().get("data", {})
                 
+                key = "pictures" if media_type == "picture" else "videos"
+                items = []
+                for k in [key, media_type, "items", "elements", "media", "files"]:
+                    if k in data_obj and isinstance(data_obj[k], list):
+                        items = data_obj[k]
+                        break
+                if not items and isinstance(r.json(), list):
+                    items = r.json()
+
                 for item in items:
-                    name = item.get("name")
-                    size = item.get("size")
+                    name = item.get("name") or item.get("filename")
+                    size = item.get("size") or item.get("filesize") or item.get("bytes")
                     if name is not None and size is not None:
-                        # Composite key: (filename, filesize)
+                        # Composite key: (filename, filesize) y versión en minúsculas
                         existing_items[(name, int(size))] = item
+                        existing_items[(name.lower(), int(size))] = item
                         
             except Exception as e:
-                logger.warning(f"No se pudo cargar el inventario de {media_type}: {e}")
+                logger.warning(f"Aviso al cargar inventario de {media_type}: {e}")
 
-        logger.debug(f"Inventario cargado: {len(existing_items)} elementos detectados en la nube.")
+        logger.info(f"Inventario en la nube: {len(existing_items)} elementos detectados en la cuenta.")
         return existing_items
 
     def upload_to_gallery(self, path: Path, is_takeout: bool = False) -> dict:
@@ -354,8 +490,13 @@ def main() -> int:
         mc.login()
         logger.info("Login correcto.")
         
+        # Inicializar base de datos de caché persistente (local al volumen)
+        cache_path = get_cache_db_path(path)
+        cache = UploadCache(cache_path)
+
         # Obtenemos TODOS los items de galería para detectar duplicados
         existing_items = mc.get_all_gallery_items()
+        cache.import_cloud_items(existing_items)
         
         total_size_mb = sum(p.stat().st_size for p in files) / (1024 * 1024)
         logger.info(f"Archivos a subir: {len(files)} (Total: {total_size_mb:.2f} MB)")
@@ -366,26 +507,34 @@ def main() -> int:
 
         def upload_task(idx, p):
             key = (p.name, p.stat().st_size)
+            key_lower = (p.name.lower(), p.stat().st_size)
             progress_prefix = f"[{idx}/{total_files}]"
 
-            if key in existing_items:
-                logger.info(f"{progress_prefix} [SKIP] {p.name} (Ya existe en la Galería)")
+            # 1. Chequeo en base de datos local SQLite persistente
+            if cache.is_uploaded(p):
+                logger.info(f"{progress_prefix} [SKIP] {p.name} (Ya registrado en caché persistente)")
+                return "skip"
+
+            # 2. Chequeo en inventario de Movistar Cloud
+            if key in existing_items or key_lower in existing_items:
+                logger.info(f"{progress_prefix} [SKIP] {p.name} (Ya existe en la Galería de Movistar Cloud)")
+                cache.mark_uploaded(p, status="ok")
                 return "skip"
 
             logger.info(f"{progress_prefix} [UPLOAD] Subiendo {p.name} ...")
             try:
                 result = mc.upload_to_gallery(p, is_takeout=args.takeout)
-                file_id = result['id']
+                file_id = result.get('id')
                 logger.info(f"{progress_prefix} [OK] {p.name} subido exitosamente (ID: {file_id}).")
+                cache.mark_uploaded(p, cloud_id=file_id, status="ok")
 
-                if not args.no_wait:
+                if not args.no_wait and file_id:
                     mc.wait_usable(file_id)
                 return "ok"
             except requests.exceptions.HTTPError as exc:
                 if exc.response is not None:
                     if exc.response.status_code == 401:
                         logger.error(f"{progress_prefix} [CRÍTICO] Sesión caducada (Error 401). Abortando proceso de inmediato.")
-                        import os
                         os._exit(1)
                     elif exc.response.status_code == 405:
                         logger.error(f"{progress_prefix} [ERROR 405] La API de Movistar rechazó la petición concurrente. Esperando 1s...")
@@ -411,7 +560,10 @@ def main() -> int:
                     skipped += 1
                 else:
                     failed += 1
-                logger.info(f"__STATS__:{ok}:{skipped}:{failed}")
+                done_count = ok + skipped + failed
+                logger.info(f"__PROGRESS__{done_count}/{total_files}")
+                logger.info(f"__STATS__:OK:{ok}|SKIP:{skipped}|ERR:{failed}")
+                sys.stdout.flush()
 
         logger.info(f"Proceso completado. Subidos={ok}, Saltados={skipped}, Errores={failed}")
         return 1 if failed else 0

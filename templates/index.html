@@ -346,8 +346,6 @@ Esperando inicio del proceso de subida...
                 explorerSubtitle: "Selecciona el directorio del NAS montado en /data",
                 selectedPathLabel: "Ruta seleccionada:",
                 folderHint: "Haz clic en una carpeta para entrar",
-                workersLabel: "Hilos concurrentes",
-                threadsUnit: "hilos",
                 recursiveLabel: "Escaneo Recursivo",
                 takeoutTitle: "📦 Google Takeout",
                 takeoutDesc: "Ignora thumbnails, lee .json",
@@ -358,7 +356,8 @@ Esperando inicio del proceso de subida...
                 statErrors: "❌ Errores",
                 readyStatus: "Listo para procesar",
                 uploadingStatus: "Subiendo archivos...",
-                cancellingStatus: "Cancelación solicitada",
+                cancellingStatus: "Cancelación solicitada...",
+                cancelledStatus: "Proceso cancelado por el usuario",
                 completedStatus: "Completado",
                 terminalLimit: "Límite dinámico: 500 líneas",
                 terminalWaiting: "Esperando inicio del proceso de subida...",
@@ -393,8 +392,6 @@ Esperando inicio del proceso de subida...
                 explorerSubtitle: "Select the NAS directory mounted under /data",
                 selectedPathLabel: "Selected path:",
                 folderHint: "Click a folder to navigate inside",
-                workersLabel: "Concurrent threads",
-                threadsUnit: "threads",
                 recursiveLabel: "Recursive Scan",
                 takeoutTitle: "📦 Google Takeout",
                 takeoutDesc: "Skips thumbnails, parses .json",
@@ -405,7 +402,8 @@ Esperando inicio del proceso de subida...
                 statErrors: "❌ Errors",
                 readyStatus: "Ready to process",
                 uploadingStatus: "Uploading files...",
-                cancellingStatus: "Cancellation requested",
+                cancellingStatus: "Cancellation requested...",
+                cancelledStatus: "Process cancelled by user",
                 completedStatus: "Completed",
                 terminalLimit: "Dynamic limit: 500 lines",
                 terminalWaiting: "Waiting for upload process to start...",
@@ -495,6 +493,7 @@ Esperando inicio del proceso de subida...
         }
 
         let isUploading = false;
+        let isCancelling = false;
         let logInterval = null;
         let envPollInterval = null;
 
@@ -512,6 +511,14 @@ Esperando inicio del proceso de subida...
                 return;
             }
 
+            isCancelling = false;
+            // Reset de contadores para la nueva subida
+            document.getElementById('stat-ok-val').textContent = '0';
+            document.getElementById('stat-skip-val').textContent = '0';
+            document.getElementById('stat-err-val').textContent = '0';
+            document.getElementById('progressBarFill').style.width = '0%';
+            document.getElementById('progressText').textContent = '0%';
+
             document.getElementById('startBtn').disabled = true;
             document.getElementById('stopBtn').disabled = false;
             document.getElementById('progress-status-label').textContent = t.uploadingStatus;
@@ -527,17 +534,36 @@ Esperando inicio del proceso de subida...
                     alert(data.message);
                     document.getElementById('startBtn').disabled = false;
                     document.getElementById('stopBtn').disabled = true;
+                    document.getElementById('progress-status-label').textContent = t.readyStatus;
                 }
+            }).catch(err => {
+                console.error("Error al iniciar subida:", err);
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+                document.getElementById('progress-status-label').textContent = t.readyStatus;
             });
         }
 
         function stopUpload() {
             const t = translations[currentLang] || translations.en;
-            fetch('/stop', { method: 'POST' }).then(() => {
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('stopBtn').disabled = true;
-                document.getElementById('progress-status-label').textContent = t.cancellingStatus;
-            });
+            isCancelling = true;
+
+            // Feedback visual INMEDIATO al hacer clic en Cancelar
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            startBtn.disabled = true;
+            stopBtn.disabled = true;
+            document.getElementById('progress-status-label').textContent = t.cancellingStatus;
+
+            fetch('/stop', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    fetchLogs();
+                })
+                .catch(err => {
+                    console.error("Error al cancelar:", err);
+                    fetchLogs();
+                });
         }
 
         function startPolling() {
@@ -550,49 +576,77 @@ Esperando inicio del proceso de subida...
             const t = translations[currentLang] || translations.en;
             fetch('/logs').then(res => res.json()).then(data => {
                 const logsElem = document.getElementById('logs');
-                logsElem.textContent = data.logs.join('\n');
-                logsElem.scrollTop = logsElem.scrollHeight;
+                if (data.logs && data.logs.length > 0) {
+                    logsElem.textContent = data.logs.join('\n');
+                    logsElem.scrollTop = logsElem.scrollHeight;
 
-                data.logs.forEach(line => {
-                    if (line.includes('__PROGRESS__')) {
-                        const parts = line.split('__PROGRESS__')[1].trim().split('/');
-                        if (parts.length === 2) {
-                            const cur = parseInt(parts[0]);
-                            const total = parseInt(parts[1]);
-                            if (total > 0) {
-                                const pct = Math.round((cur / total) * 100);
-                                document.getElementById('progressBarFill').style.width = pct + '%';
-                                document.getElementById('progressText').textContent = pct + '%';
+                    data.logs.forEach(line => {
+                        if (line.includes('__PROGRESS__')) {
+                            const raw = line.split('__PROGRESS__')[1].replace(/^[:\s]+/, '').trim();
+                            const parts = raw.split('/');
+                            if (parts.length === 2) {
+                                const cur = parseInt(parts[0]);
+                                const total = parseInt(parts[1]);
+                                if (total > 0) {
+                                    const pct = Math.round((cur / total) * 100);
+                                    document.getElementById('progressBarFill').style.width = pct + '%';
+                                    document.getElementById('progressText').textContent = pct + '% (' + cur + '/' + total + ')';
+                                }
                             }
                         }
-                    }
-                    if (line.includes('__STATS__')) {
-                        const parts = line.split('__STATS__')[1].trim().split('|');
-                        parts.forEach(p => {
-                            const [k, v] = p.split(':');
-                            if (k === 'OK') document.getElementById('stat-ok-val').textContent = v;
-                            if (k === 'SKIP') document.getElementById('stat-skip-val').textContent = v;
-                            if (k === 'ERR') document.getElementById('stat-err-val').textContent = v;
-                        });
-                    }
-                });
+                        if (line.includes('__STATS__')) {
+                            const statStr = line.split('__STATS__')[1].replace(/^[:\s]+/, '').trim();
+                            if (statStr.includes('|')) {
+                                statStr.split('|').forEach(p => {
+                                    const [k, v] = p.split(':');
+                                    if (k && v !== undefined) {
+                                        if (k.trim() === 'OK') document.getElementById('stat-ok-val').textContent = v.trim();
+                                        if (k.trim() === 'SKIP') document.getElementById('stat-skip-val').textContent = v.trim();
+                                        if (k.trim() === 'ERR') document.getElementById('stat-err-val').textContent = v.trim();
+                                    }
+                                });
+                            } else if (statStr.includes(':')) {
+                                const parts = statStr.split(':');
+                                if (parts.length >= 3) {
+                                    document.getElementById('stat-ok-val').textContent = parts[0].trim();
+                                    document.getElementById('stat-skip-val').textContent = parts[1].trim();
+                                    document.getElementById('stat-err-val').textContent = parts[2].trim();
+                                }
+                            }
+                        }
+                    });
+                }
 
                 const startBtn = document.getElementById('startBtn');
                 const stopBtn = document.getElementById('stopBtn');
-                const isRunning = data.is_running || data.running;
+                const isRunning = Boolean(data.is_running || data.running);
 
                 if (isRunning) {
-                    startBtn.disabled = true;
-                    stopBtn.disabled = false;
+                    if (isCancelling) {
+                        startBtn.disabled = true;
+                        stopBtn.disabled = true;
+                        document.getElementById('progress-status-label').textContent = t.cancellingStatus;
+                    } else {
+                        startBtn.disabled = true;
+                        stopBtn.disabled = false;
+                        document.getElementById('progress-status-label').textContent = t.uploadingStatus;
+                    }
                 } else {
+                    isCancelling = false;
                     startBtn.disabled = false;
                     stopBtn.disabled = true;
-                    if (logInterval && data.logs.length > 0 && data.logs[data.logs.length-1].includes('Proceso finalizado')) {
-                        clearInterval(logInterval);
-                        logInterval = null;
-                        document.getElementById('progress-status-label').textContent = t.completedStatus;
+
+                    if (data.logs && data.logs.length > 0) {
+                        const lastLine = data.logs[data.logs.length - 1];
+                        if (lastLine.includes('abortado por el usuario') || lastLine.includes('cancelado')) {
+                            document.getElementById('progress-status-label').textContent = t.cancelledStatus;
+                        } else if (lastLine.includes('Proceso finalizado') || lastLine.includes('Proceso completado')) {
+                            document.getElementById('progress-status-label').textContent = t.completedStatus;
+                        }
                     }
                 }
+            }).catch(err => {
+                console.error("Error al obtener logs:", err);
             });
         }
 
