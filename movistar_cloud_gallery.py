@@ -55,23 +55,26 @@ class UploadCache:
     def _init_db(self):
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._get_conn() as conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS uploaded_files (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        file_path TEXT NOT NULL,
-                        file_name TEXT NOT NULL,
-                        file_size INTEGER NOT NULL,
-                        mtime REAL NOT NULL,
-                        cloud_id INTEGER,
-                        uploaded_at TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        UNIQUE(file_path, file_size)
-                    )
-                """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
-                conn.commit()
+            conn = self._get_conn()
+            try:
+                with conn:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS uploaded_files (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            file_path TEXT NOT NULL,
+                            file_name TEXT NOT NULL,
+                            file_size INTEGER NOT NULL,
+                            mtime REAL NOT NULL,
+                            cloud_id INTEGER,
+                            uploaded_at TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            UNIQUE(file_path, file_size)
+                        )
+                    """)
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
+            finally:
+                conn.close()
             logging.getLogger("MovistarGallery").info(f"Caché local persistente inicializada en: {self.db_path}")
         except Exception as e:
             logging.getLogger("MovistarGallery").warning(f"No se pudo inicializar base de datos de caché en {self.db_path}: {e}")
@@ -83,21 +86,25 @@ class UploadCache:
             name = path.name
             rel_path = str(path)
             
-            with self._get_conn() as conn:
-                # 1. Chequeo por ruta completa y tamaño
-                cur = conn.execute(
-                    "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok'",
-                    (rel_path, size)
-                )
-                if cur.fetchone():
-                    return True
-                # 2. Chequeo por nombre de archivo y tamaño
-                cur = conn.execute(
-                    "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok'",
-                    (name, size)
-                )
-                if cur.fetchone():
-                    return True
+            conn = self._get_conn()
+            try:
+                with conn:
+                    # 1. Chequeo por ruta completa y tamaño
+                    cur = conn.execute(
+                        "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok'",
+                        (rel_path, size)
+                    )
+                    if cur.fetchone():
+                        return True
+                    # 2. Chequeo por nombre de archivo y tamaño
+                    cur = conn.execute(
+                        "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok'",
+                        (name, size)
+                    )
+                    if cur.fetchone():
+                        return True
+            finally:
+                conn.close()
         except Exception as e:
             logging.getLogger("MovistarGallery").debug(f"Error consultando caché para {path.name}: {e}")
         return False
@@ -111,16 +118,19 @@ class UploadCache:
             rel_path = str(path)
             now = datetime.now(timezone.utc).isoformat()
             
-            with self._get_conn() as conn:
-                conn.execute("""
-                    INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(file_path, file_size) DO UPDATE SET
-                        cloud_id = excluded.cloud_id,
-                        uploaded_at = excluded.uploaded_at,
-                        status = excluded.status
-                """, (rel_path, name, size, mtime, cloud_id, now, status))
-                conn.commit()
+            conn = self._get_conn()
+            try:
+                with conn:
+                    conn.execute("""
+                        INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(file_path, file_size) DO UPDATE SET
+                            cloud_id = excluded.cloud_id,
+                            uploaded_at = excluded.uploaded_at,
+                            status = excluded.status
+                    """, (rel_path, name, size, mtime, cloud_id, now, status))
+            finally:
+                conn.close()
         except Exception as e:
             logging.getLogger("MovistarGallery").warning(f"No se pudo registrar {path.name} en la caché: {e}")
 
@@ -129,14 +139,17 @@ class UploadCache:
             return
         try:
             now = datetime.now(timezone.utc).isoformat()
-            with self._get_conn() as conn:
-                for (name, size), item in items_dict.items():
-                    cloud_id = item.get("id") if isinstance(item, dict) else None
-                    conn.execute("""
-                        INSERT OR IGNORE INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
-                        VALUES (?, ?, ?, 0, ?, ?, 'ok')
-                    """, (str(name), str(name), int(size), cloud_id, now))
-                conn.commit()
+            conn = self._get_conn()
+            try:
+                with conn:
+                    for (name, size), item in items_dict.items():
+                        cloud_id = item.get("id") if isinstance(item, dict) else None
+                        conn.execute("""
+                            INSERT OR IGNORE INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
+                            VALUES (?, ?, ?, 0, ?, ?, 'ok')
+                        """, (str(name), str(name), int(size), cloud_id, now))
+            finally:
+                conn.close()
         except Exception as e:
             logging.getLogger("MovistarGallery").debug(f"Error importando items de nube a la caché: {e}")
 
