@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="es" class="h-full bg-slate-50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Movistar Cloud Gallery Uploader</title>
+    <!-- Google Fonts & Tailwind CSS -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        movistar: {
+                            50: '#eef8ff',
+                            100: '#d9f0ff',
+                            200: '#bce4ff',
+                            400: '#52b5ff',
+                            500: '#019df4',
+                            600: '#0082d4',
+                            700: '#005cff',
+                            800: '#0b2742',
+                            900: '#061727'
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace']
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .dark-scroll::-webkit-scrollbar-thumb { background: #334155; }
+        .dark-scroll::-webkit-scrollbar-thumb:hover { background: #475569; }
+    </style>
+</head>
+<body class="min-h-full flex flex-col text-slate-800 antialiased selection:bg-movistar-500 selection:text-white">
+
+    <!-- Top Navigation Header -->
+    <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+        <div class="max-w-[1800px] mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-movistar-700 to-movistar-500 flex items-center justify-center text-white shadow-md shadow-movistar-500/20">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 00-9.78 2.096A4.001 4.001 0 003 15z"></path>
+                    </svg>
+                </div>
+                <div>
+                    <div class="flex items-center space-x-2">
+                        <h1 class="text-lg font-bold text-slate-900 tracking-tight">Movistar Cloud Gallery</h1>
+                    </div>
+                    <p class="text-xs text-slate-500" data-i18n="appSubtitle">Sincronizador masivo de Galería nativa (Android API)</p>
+                </div>
+            </div>
+
+            <!-- Server, Session Status & Language Switcher -->
+            <div class="flex items-center space-x-3 sm:space-x-4">
+                <div id="session-badge" class="hidden sm:flex items-center space-x-2 px-3 py-1.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-medium">
+                    <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <span id="session-status-text" data-i18n="sessionNotDetected">Sesión no detectada</span>
+                </div>
+                
+                <div class="flex items-center space-x-2 text-xs text-slate-500 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200">
+                    <span class="font-mono" id="server-host-text">Host: local</span>
+                </div>
+
+                <!-- Language Toggle Button -->
+                <button onclick="toggleLanguage()" id="lang-btn" class="flex items-center space-x-1.5 text-xs font-semibold px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg transition" title="Cambiar idioma / Change language">
+                    <span>🌐</span>
+                    <span id="lang-btn-text">EN</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <main class="flex-1 w-full max-w-[1800px] mx-auto px-3 sm:px-6 lg:px-8 py-5 space-y-5">
+
+        <!-- Top Grid: Credentials & Upload Settings -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            
+            <!-- Left Card: Credentials & Login (col 12 / lg 5) -->
+            <div class="lg:col-span-5 bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-5">
+                <div class="flex items-center justify-between border-b border-slate-100 pb-4">
+                    <div class="flex items-center space-x-2.5">
+                        <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-base font-semibold text-slate-900" data-i18n="credentialsTitle">Credenciales de Sesión</h2>
+                            <p class="text-xs text-slate-500" data-i18n="credentialsSubtitle">Inicia sesión de forma segura o introduce tus tokens</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Virtual Browser Action Box -->
+                <div class="bg-gradient-to-br from-slate-50 to-movistar-50/30 p-4 rounded-xl border border-movistar-100 space-y-3">
+                    <div class="flex items-start justify-between">
+                        <div>
+                            <h3 class="text-sm font-semibold text-slate-900" data-i18n="vncBoxTitle">Navegador Virtual en Servidor</h3>
+                            <p class="text-xs text-slate-600 mt-0.5" data-i18n="vncBoxDesc">Abre el navegador remoto en pantalla amplia para poner tu teléfono y SMS.</p>
+                        </div>
+                        <div class="flex items-center space-x-1.5 text-xs text-slate-500 bg-white px-2.5 py-1 rounded-md border border-slate-200">
+                            <span data-i18n="portLabel">Puerto:</span>
+                            <input type="number" id="vnc-port" value="8084" class="w-14 font-mono font-semibold text-slate-800 bg-transparent text-right outline-none">
+                        </div>
+                    </div>
+                    
+                    <button onclick="openVncModal()" class="w-full flex items-center justify-center space-x-2 px-4 py-2.5 bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-700 hover:to-emerald-600 text-white font-medium text-sm rounded-xl shadow-sm transition transform active:scale-[0.99]">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+                        </svg>
+                        <span data-i18n="openVncBtn">🌐 Abrir Navegador Virtual (Login Cómodo)</span>
+                    </button>
+                </div>
+
+                <!-- Inputs JSESSIONID & VALIDATIONKEY -->
+                <div class="space-y-4 pt-1">
+                    <div>
+                        <div class="flex items-center justify-between mb-1.5">
+                            <label for="jsessionid" class="text-xs font-semibold text-slate-700 tracking-wide">MOVISTAR_JSESSIONID</label>
+                            <span class="text-[11px] text-slate-400 font-mono" data-i18n="sessionCookieLabel">Cookie de sesión</span>
+                        </div>
+                        <input type="text" id="jsessionid" value="{{ jsessionid }}" data-i18n-ph="jsessionidPlaceholder" placeholder="Ej: E370FC8F2B597354DCE9CD92F31422F6.2i148" class="w-full text-xs font-mono px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:border-movistar-500 focus:ring-2 focus:ring-movistar-500/20 outline-none transition text-slate-900">
+                    </div>
+
+                    <div>
+                        <div class="flex items-center justify-between mb-1.5">
+                            <label for="validationkey" class="text-xs font-semibold text-slate-700 tracking-wide">MOVISTAR_VALIDATIONKEY</label>
+                            <span class="text-[11px] text-slate-400 font-mono" data-i18n="validationKeyLabel">Token API Galería</span>
+                        </div>
+                        <input type="text" id="validationkey" value="{{ validationkey }}" data-i18n-ph="validationkeyPlaceholder" placeholder="Ej: 30467c2b2a3f405b5146323621295962" class="w-full text-xs font-mono px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:border-movistar-500 focus:ring-2 focus:ring-movistar-500/20 outline-none transition text-slate-900">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Card: Upload Configuration & File Explorer (col 12 / lg 7) -->
+            <div class="lg:col-span-7 bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-5">
+                <div class="flex items-center justify-between border-b border-slate-100 pb-4">
+                    <div class="flex items-center space-x-2.5">
+                        <div class="p-2 bg-movistar-50 text-movistar-600 rounded-lg">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-base font-semibold text-slate-900" data-i18n="explorerTitle">Explorador & Opciones de Subida</h2>
+                            <p class="text-xs text-slate-500" data-i18n="explorerSubtitle">Selecciona el directorio del NAS montado en /data</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Path & File Tree Explorer -->
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between">
+                        <label class="text-xs font-semibold text-slate-700" data-i18n="selectedPathLabel">Ruta seleccionada:</label>
+                        <span class="text-xs text-movistar-600 font-medium" data-i18n="folderHint">Haz clic en una carpeta para entrar</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <div class="relative flex-1">
+                            <span class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
+                                📁
+                            </span>
+                            <input type="text" id="path" value="/data" readonly class="w-full text-xs font-mono pl-9 pr-4 py-2 bg-slate-100 border border-slate-200 rounded-xl text-slate-800 font-semibold cursor-not-allowed">
+                        </div>
+                    </div>
+
+                    <!-- Directory list tree -->
+                    <div class="border border-slate-200 rounded-xl bg-slate-50/50 overflow-hidden">
+                        <div id="browser-list" class="max-h-52 overflow-y-auto divide-y divide-slate-100 p-1 text-xs">
+                            <!-- Injected dynamically -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Parameters Grid -->
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
+                    <div class="bg-slate-50 p-3 rounded-xl border border-slate-200/80">
+                        <label for="workers" class="block text-xs font-semibold text-slate-700 mb-1" data-i18n="workersLabel">Hilos concurrentes</label>
+                        <div class="flex items-center space-x-2">
+                            <input type="number" id="workers" value="3" min="1" max="10" class="w-full text-sm font-semibold px-3 py-1.5 bg-white border border-slate-200 rounded-lg focus:border-movistar-500 outline-none">
+                            <span class="text-xs text-slate-500" data-i18n="threadsUnit">hilos</span>
+                        </div>
+                    </div>
+
+                    <div class="bg-slate-50 p-3 rounded-xl border border-slate-200/80 flex items-center">
+                        <label class="relative flex items-center space-x-2.5 cursor-pointer">
+                            <input type="checkbox" id="recursive" checked class="w-4 h-4 text-movistar-600 rounded border-slate-300 focus:ring-movistar-500">
+                            <span class="text-xs font-semibold text-slate-800 select-none" data-i18n="recursiveLabel">Escaneo Recursivo</span>
+                        </label>
+                    </div>
+
+                    <div class="bg-slate-50 p-3 rounded-xl border border-slate-200/80 flex items-center">
+                        <label class="relative flex items-start space-x-2.5 cursor-pointer">
+                            <input type="checkbox" id="takeout" class="w-4 h-4 mt-0.5 text-movistar-600 rounded border-slate-300 focus:ring-movistar-500">
+                            <div>
+                                <span class="text-xs font-semibold text-slate-800 select-none block" data-i18n="takeoutTitle">📦 Google Takeout</span>
+                                <span class="text-[10px] text-slate-500 leading-tight block" data-i18n="takeoutDesc">Ignora thumbnails, lee .json</span>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Bottom Section: Actions, Stats & Live Terminal -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-6">
+            
+            <!-- Controls & Big Metric Counters -->
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-100 pb-6">
+                <!-- Action Buttons -->
+                <div class="flex items-center space-x-3">
+                    <button id="startBtn" onclick="startUpload()" class="flex items-center space-x-2 px-6 py-3 bg-movistar-600 hover:bg-movistar-700 text-white font-semibold text-sm rounded-xl shadow-md shadow-movistar-600/20 transition transform active:scale-95">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span data-i18n="startUploadBtn">Iniciar Subida</span>
+                    </button>
+                    <button id="stopBtn" onclick="stopUpload()" disabled class="flex items-center space-x-2 px-5 py-3 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold text-sm rounded-xl transition disabled:opacity-50 disabled:cursor-not-allowed">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"></path>
+                        </svg>
+                        <span data-i18n="cancelBtn">Cancelar</span>
+                    </button>
+                </div>
+
+                <!-- Stats KPI Grid -->
+                <div class="grid grid-cols-3 gap-3 w-full md:w-auto">
+                    <div class="bg-emerald-50/70 border border-emerald-200/80 px-4 py-2.5 rounded-xl text-center">
+                        <span class="text-xs text-emerald-700 font-medium block" data-i18n="statUploaded">✅ Subidas</span>
+                        <span id="stat-ok-val" class="text-lg font-bold text-emerald-900 font-mono">0</span>
+                    </div>
+                    <div class="bg-amber-50/70 border border-amber-200/80 px-4 py-2.5 rounded-xl text-center">
+                        <span class="text-xs text-amber-700 font-medium block" data-i18n="statSkipped">⏭️ Omitidas (Duplicadas)</span>
+                        <span id="stat-skip-val" class="text-lg font-bold text-amber-900 font-mono">0</span>
+                    </div>
+                    <div class="bg-rose-50/70 border border-rose-200/80 px-4 py-2.5 rounded-xl text-center">
+                        <span class="text-xs text-rose-700 font-medium block" data-i18n="statErrors">❌ Errores</span>
+                        <span id="stat-err-val" class="text-lg font-bold text-rose-900 font-mono">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Progress Bar -->
+            <div class="space-y-2">
+                <div class="flex items-center justify-between text-xs font-semibold text-slate-700">
+                    <span id="progress-status-label" data-i18n="readyStatus">Listo para procesar</span>
+                    <span id="progressText" class="font-mono text-movistar-700 font-bold text-sm">0%</span>
+                </div>
+                <div class="w-full h-3 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
+                    <div id="progressBarFill" class="h-full bg-gradient-to-r from-movistar-500 to-movistar-700 transition-all duration-300 w-0"></div>
+                </div>
+            </div>
+
+            <!-- Dark Terminal Console -->
+            <div class="space-y-2">
+                <div class="flex items-center justify-between text-xs text-slate-500">
+                    <div class="flex items-center space-x-2">
+                        <div class="flex space-x-1.5">
+                            <span class="w-3 h-3 rounded-full bg-rose-500/80 inline-block"></span>
+                            <span class="w-3 h-3 rounded-full bg-amber-500/80 inline-block"></span>
+                            <span class="w-3 h-3 rounded-full bg-emerald-500/80 inline-block"></span>
+                        </div>
+                        <span class="font-mono text-[11px] text-slate-600 font-medium ml-2">daemon@movistar-cloud: ~ live output stream</span>
+                    </div>
+                    <span class="text-[11px] text-slate-400" data-i18n="terminalLimit">Límite dinámico: 500 líneas</span>
+                </div>
+
+                <div id="logs" class="dark-scroll bg-slate-950 text-emerald-400 font-mono text-xs p-4 rounded-xl h-96 overflow-y-auto whitespace-pre-wrap leading-relaxed shadow-inner border border-slate-800">
+Esperando inicio del proceso de subida...
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <!-- Expansive Fullscreen/Large VNC Modal Overlay -->
+    <div id="vnc-modal" class="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-sm hidden flex items-center justify-center p-2 sm:p-4 animate-fade-in">
+        <div class="bg-white rounded-2xl shadow-2xl border border-slate-200 flex flex-col w-[96vw] max-w-[1800px] h-[94vh] overflow-hidden">
+            <!-- Modal Header -->
+            <div class="px-6 py-4 bg-slate-900 text-white flex items-center justify-between border-b border-slate-800">
+                <div class="flex items-center space-x-3">
+                    <span class="p-2 bg-movistar-600 text-white rounded-lg">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+                        </svg>
+                    </span>
+                    <div>
+                        <h3 class="text-base font-bold text-white flex items-center space-x-2">
+                            <span data-i18n="modalTitle">Navegador Virtual Remoto</span>
+                            <span class="px-2 py-0.5 text-[11px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-md font-mono font-medium" data-i18n="modalBadge">Resolución Amplia 1600x900</span>
+                        </h3>
+                        <p class="text-xs text-slate-400" data-i18n="modalSubtitle">Inicia sesión con tu teléfono y código SMS. La ventana se cerrará automáticamente al autenticarte.</p>
+                    </div>
+                </div>
+
+                <!-- Modal Actions -->
+                <button onclick="closeVncModal()" class="px-4 py-2 bg-slate-800 hover:bg-rose-600 text-slate-200 hover:text-white rounded-xl text-xs font-semibold transition flex items-center space-x-1.5 border border-slate-700">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                    <span data-i18n="closeVncBtn">Cerrar Navegador</span>
+                </button>
+            </div>
+
+            <!-- Modal Body (Iframe) -->
+            <div class="flex-1 bg-slate-950 relative">
+                <iframe id="vnc-iframe" class="w-full h-full border-0" src=""></iframe>
+            </div>
+
+            <!-- Modal Footer Indicator -->
+            <div class="px-6 py-3 bg-slate-100 border-t border-slate-200 flex items-center justify-between text-xs text-slate-600">
+                <div class="flex items-center space-x-2">
+                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping"></span>
+                    <span data-i18n="capturingIndicator">Capturador de tokens en escucha continua...</span>
+                </div>
+                <span class="font-mono text-slate-400" data-i18n="modalFooterHint">Presiona 'Cerrar Navegador' en cualquier momento si deseas cancelarlo</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Frontend Scripting Logic & i18n Dictionary -->
+    <script>
+        const translations = {
+            es: {
+                appSubtitle: "Sincronizador masivo de Galería nativa (Android API)",
+                sessionNotDetected: "Sesión no detectada",
+                sessionDetected: "Token de Sesión Cargado ✓",
+                sessionMissingWarning: "Sin sesión activa (Inicia Login)",
+                credentialsTitle: "Credenciales de Sesión",
+                credentialsSubtitle: "Inicia sesión de forma segura o introduce tus tokens",
+                vncBoxTitle: "Navegador Virtual en Servidor",
+                vncBoxDesc: "Abre el navegador remoto en pantalla amplia para poner tu teléfono y SMS.",
+                portLabel: "Puerto:",
+                openVncBtn: "🌐 Abrir Navegador Virtual (Login Cómodo)",
+                sessionCookieLabel: "Cookie de sesión",
+                jsessionidPlaceholder: "Ej: E370FC8F2B597354DCE9CD92F31422F6.2i148",
+                validationKeyLabel: "Token API Galería",
+                validationkeyPlaceholder: "Ej: 30467c2b2a3f405b5146323621295962",
+                explorerTitle: "Explorador & Opciones de Subida",
+                explorerSubtitle: "Selecciona el directorio del NAS montado en /data",
+                selectedPathLabel: "Ruta seleccionada:",
+                folderHint: "Haz clic en una carpeta para entrar",
+                workersLabel: "Hilos concurrentes",
+                threadsUnit: "hilos",
+                recursiveLabel: "Escaneo Recursivo",
+                takeoutTitle: "📦 Google Takeout",
+                takeoutDesc: "Ignora thumbnails, lee .json",
+                startUploadBtn: "Iniciar Subida",
+                cancelBtn: "Cancelar",
+                statUploaded: "✅ Subidas",
+                statSkipped: "⏭️ Omitidas (Duplicadas)",
+                statErrors: "❌ Errores",
+                readyStatus: "Listo para procesar",
+                uploadingStatus: "Subiendo archivos...",
+                cancellingStatus: "Cancelación solicitada",
+                completedStatus: "Completado",
+                terminalLimit: "Límite dinámico: 500 líneas",
+                terminalWaiting: "Esperando inicio del proceso de subida...",
+                modalTitle: "Navegador Virtual Remoto",
+                modalBadge: "Resolución Amplia 1600x900",
+                modalSubtitle: "Inicia sesión con tu teléfono y código SMS. La ventana se cerrará automáticamente al autenticarte.",
+                closeVncBtn: "Cerrar Navegador",
+                capturingIndicator: "Capturador de tokens en escucha continua...",
+                modalFooterHint: "Presiona 'Cerrar Navegador' en cualquier momento si deseas cancelarlo",
+                upFolderText: "⤴️ .. (Subir un nivel)",
+                emptyFolderText: "No hay más subcarpetas aquí",
+                openFolderText: "Abrir ➔",
+                missingCredsAlert: "Por favor introduce las credenciales o abre el Navegador Virtual primero.",
+                sessionCapturedAlert: "¡Sesión capturada con éxito en Movistar Cloud!"
+            },
+            en: {
+                appSubtitle: "Bulk native Gallery sync tool (Android API)",
+                sessionNotDetected: "Session not detected",
+                sessionDetected: "Session Token Loaded ✓",
+                sessionMissingWarning: "No active session (Log in first)",
+                credentialsTitle: "Session Credentials",
+                credentialsSubtitle: "Log in securely or enter your tokens manually",
+                vncBoxTitle: "Virtual Browser on Server",
+                vncBoxDesc: "Open the remote browser in widescreen to enter your phone number & SMS.",
+                portLabel: "Port:",
+                openVncBtn: "🌐 Open Virtual Browser (Easy Login)",
+                sessionCookieLabel: "Session cookie",
+                jsessionidPlaceholder: "e.g., E370FC8F2B597354DCE9CD92F31422F6.2i148",
+                validationKeyLabel: "Gallery API Token",
+                validationkeyPlaceholder: "e.g., 30467c2b2a3f405b5146323621295962",
+                explorerTitle: "File Explorer & Upload Options",
+                explorerSubtitle: "Select the NAS directory mounted under /data",
+                selectedPathLabel: "Selected path:",
+                folderHint: "Click a folder to navigate inside",
+                workersLabel: "Concurrent threads",
+                threadsUnit: "threads",
+                recursiveLabel: "Recursive Scan",
+                takeoutTitle: "📦 Google Takeout",
+                takeoutDesc: "Skips thumbnails, parses .json",
+                startUploadBtn: "Start Upload",
+                cancelBtn: "Cancel",
+                statUploaded: "✅ Uploaded",
+                statSkipped: "⏭️ Skipped (Duplicates)",
+                statErrors: "❌ Errors",
+                readyStatus: "Ready to process",
+                uploadingStatus: "Uploading files...",
+                cancellingStatus: "Cancellation requested",
+                completedStatus: "Completed",
+                terminalLimit: "Dynamic limit: 500 lines",
+                terminalWaiting: "Waiting for upload process to start...",
+                modalTitle: "Remote Virtual Browser",
+                modalBadge: "Widescreen 1600x900",
+                modalSubtitle: "Log in with your phone number and SMS code. The window will close automatically once authenticated.",
+                closeVncBtn: "Close Browser",
+                capturingIndicator: "Token capturer listening continuously...",
+                modalFooterHint: "Press 'Close Browser' at any time if you wish to abort",
+                upFolderText: "⤴️ .. (Go up one level)",
+                emptyFolderText: "No more subfolders here",
+                openFolderText: "Open ➔",
+                missingCredsAlert: "Please enter your credentials or open the Virtual Browser first.",
+                sessionCapturedAlert: "Session successfully captured from Movistar Cloud!"
+            }
+        };
+
+        // Detect browser / system language: Spanish -> 'es', Any other language -> 'en'
+        function detectLanguage() {
+            const saved = localStorage.getItem('movistar_lang');
+            if (saved && (saved === 'es' || saved === 'en')) {
+                return saved;
+            }
+            const navLang = (navigator.language || navigator.userLanguage || 'es').toLowerCase();
+            return navLang.startsWith('es') ? 'es' : 'en';
+        }
+
+        let currentLang = detectLanguage();
+
+        function applyLanguage(lang) {
+            currentLang = lang;
+            localStorage.setItem('movistar_lang', lang);
+            document.documentElement.lang = lang;
+            
+            const t = translations[lang] || translations.en;
+
+            // Translate elements with data-i18n attribute
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                if (t[key]) el.textContent = t[key];
+            });
+
+            // Translate placeholders
+            document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+                const key = el.getAttribute('data-i18n-ph');
+                if (t[key]) el.setAttribute('placeholder', t[key]);
+            });
+
+            // Update language toggle button text
+            const langBtnText = document.getElementById('lang-btn-text');
+            if (langBtnText) {
+                langBtnText.textContent = (lang === 'es') ? 'EN' : 'ES';
+            }
+
+            // Update terminal placeholder if empty or default
+            const logsElem = document.getElementById('logs');
+            if (logsElem && (logsElem.textContent.trim() === translations.es.terminalWaiting || logsElem.textContent.trim() === translations.en.terminalWaiting || logsElem.textContent.trim() === 'Esperando inicio del proceso de subida...')) {
+                logsElem.textContent = t.terminalWaiting;
+            }
+
+            updateSessionBadge();
+        }
+
+        function toggleLanguage() {
+            const nextLang = (currentLang === 'es') ? 'en' : 'es';
+            applyLanguage(nextLang);
+        }
+
+        document.getElementById('server-host-text').textContent = 'Host: ' + window.location.hostname;
+
+        function updateSessionBadge() {
+            const jsid = document.getElementById('jsessionid').value.trim();
+            const vk = document.getElementById('validationkey').value.trim();
+            const badge = document.getElementById('session-badge');
+            const text = document.getElementById('session-status-text');
+            const t = translations[currentLang] || translations.en;
+
+            if (jsid && vk) {
+                badge.className = 'flex items-center space-x-2 px-3 py-1.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-medium';
+                badge.querySelector('span').className = 'w-2 h-2 rounded-full bg-emerald-500';
+                text.textContent = t.sessionDetected;
+            } else {
+                badge.className = 'flex items-center space-x-2 px-3 py-1.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-lg text-xs font-medium';
+                badge.querySelector('span').className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
+                text.textContent = t.sessionMissingWarning;
+            }
+        }
+
+        let isUploading = false;
+        let logInterval = null;
+        let envPollInterval = null;
+
+        function startUpload() {
+            const path = document.getElementById('path').value;
+            const jsessionid = document.getElementById('jsessionid').value;
+            const validationkey = document.getElementById('validationkey').value;
+            const workers = document.getElementById('workers').value;
+            const recursive = document.getElementById('recursive').checked;
+            const takeout = document.getElementById('takeout').checked;
+            const t = translations[currentLang] || translations.en;
+
+            if (!jsessionid || !validationkey) {
+                alert(t.missingCredsAlert);
+                return;
+            }
+
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            document.getElementById('progress-status-label').textContent = t.uploadingStatus;
+
+            fetch('/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path, jsessionid, validationkey, workers, recursive, takeout })
+            }).then(res => res.json()).then(data => {
+                if (data.status === 'ok') {
+                    startPolling();
+                } else {
+                    alert(data.message);
+                    document.getElementById('startBtn').disabled = false;
+                    document.getElementById('stopBtn').disabled = true;
+                }
+            });
+        }
+
+        function stopUpload() {
+            const t = translations[currentLang] || translations.en;
+            fetch('/stop', { method: 'POST' }).then(() => {
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+                document.getElementById('progress-status-label').textContent = t.cancellingStatus;
+            });
+        }
+
+        function startPolling() {
+            if (logInterval) clearInterval(logInterval);
+            logInterval = setInterval(fetchLogs, 1500);
+            fetchLogs();
+        }
+
+        function fetchLogs() {
+            const t = translations[currentLang] || translations.en;
+            fetch('/logs').then(res => res.json()).then(data => {
+                const logsElem = document.getElementById('logs');
+                logsElem.textContent = data.logs.join('\n');
+                logsElem.scrollTop = logsElem.scrollHeight;
+
+                data.logs.forEach(line => {
+                    if (line.includes('__PROGRESS__')) {
+                        const parts = line.split('__PROGRESS__')[1].trim().split('/');
+                        if (parts.length === 2) {
+                            const cur = parseInt(parts[0]);
+                            const total = parseInt(parts[1]);
+                            if (total > 0) {
+                                const pct = Math.round((cur / total) * 100);
+                                document.getElementById('progressBarFill').style.width = pct + '%';
+                                document.getElementById('progressText').textContent = pct + '%';
+                            }
+                        }
+                    }
+                    if (line.includes('__STATS__')) {
+                        const parts = line.split('__STATS__')[1].trim().split('|');
+                        parts.forEach(p => {
+                            const [k, v] = p.split(':');
+                            if (k === 'OK') document.getElementById('stat-ok-val').textContent = v;
+                            if (k === 'SKIP') document.getElementById('stat-skip-val').textContent = v;
+                            if (k === 'ERR') document.getElementById('stat-err-val').textContent = v;
+                        });
+                    }
+                });
+
+                const startBtn = document.getElementById('startBtn');
+                const stopBtn = document.getElementById('stopBtn');
+
+                if (data.is_running) {
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+                } else {
+                    startBtn.disabled = false;
+                    stopBtn.disabled = true;
+                    if (logInterval && data.logs.length > 0 && data.logs[data.logs.length-1].includes('Proceso finalizado')) {
+                        clearInterval(logInterval);
+                        logInterval = null;
+                        document.getElementById('progress-status-label').textContent = t.completedStatus;
+                    }
+                }
+            });
+        }
+
+        // Recover stored credentials
+        if (!document.getElementById('jsessionid').value) {
+            document.getElementById('jsessionid').value = localStorage.getItem('movistar_jsid') || '';
+        }
+        if (!document.getElementById('validationkey').value) {
+            document.getElementById('validationkey').value = localStorage.getItem('movistar_vkey') || '';
+        }
+
+        document.getElementById('jsessionid').addEventListener('input', (e) => {
+            localStorage.setItem('movistar_jsid', e.target.value);
+            updateSessionBadge();
+        });
+        document.getElementById('validationkey').addEventListener('input', (e) => {
+            localStorage.setItem('movistar_vkey', e.target.value);
+            updateSessionBadge();
+        });
+
+        // Expansive VNC Modal Management
+        function openVncModal() {
+            fetch('/start_login', { method: 'POST' });
+            
+            const host = window.location.hostname;
+            const vncPort = document.getElementById('vnc-port').value || 8084;
+            document.getElementById('vnc-iframe').src = `http://${host}:${vncPort}/vnc.html?autoconnect=true&resize=scale`;
+            document.getElementById('vnc-modal').classList.remove('hidden');
+
+            if (!envPollInterval) {
+                envPollInterval = setInterval(pollEnv, 2000);
+            }
+        }
+
+        function closeVncModal() {
+            fetch('/stop_login', { method: 'POST' });
+            document.getElementById('vnc-modal').classList.add('hidden');
+            document.getElementById('vnc-iframe').src = '';
+            if (envPollInterval) {
+                clearInterval(envPollInterval);
+                envPollInterval = null;
+            }
+        }
+
+        function pollEnv() {
+            const t = translations[currentLang] || translations.en;
+            fetch('/env')
+            .then(res => res.json())
+            .then(data => {
+                if (data.jsessionid && data.validationkey) {
+                    document.getElementById('jsessionid').value = data.jsessionid;
+                    document.getElementById('validationkey').value = data.validationkey;
+                    localStorage.setItem('movistar_jsid', data.jsessionid);
+                    localStorage.setItem('movistar_vkey', data.validationkey);
+                    updateSessionBadge();
+                    
+                    closeVncModal();
+                    alert(t.sessionCapturedAlert);
+                }
+            });
+        }
+
+        function loadFolder(targetPath) {
+            const t = translations[currentLang] || translations.en;
+            fetch('/folders?path=' + encodeURIComponent(targetPath))
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('path').value = data.current_path;
+                const list = document.getElementById('browser-list');
+                list.innerHTML = '';
+                
+                // Button to go up one level
+                if (data.parent) {
+                    const upDiv = document.createElement('div');
+                    upDiv.className = 'flex items-center space-x-2 px-3 py-2 hover:bg-movistar-50 text-movistar-700 font-semibold cursor-pointer rounded-lg transition';
+                    upDiv.innerHTML = `<span>⤴️</span><span>${t.upFolderText}</span>`;
+                    upDiv.onclick = () => loadFolder(data.parent);
+                    list.appendChild(upDiv);
+                }
+                
+                // Subfolders
+                if (data.folders.length === 0) {
+                    const empty = document.createElement('div');
+                    empty.className = 'p-3 text-slate-400 italic text-center';
+                    empty.textContent = t.emptyFolderText;
+                    list.appendChild(empty);
+                } else {
+                    data.folders.forEach(f => {
+                        const div = document.createElement('div');
+                        div.className = 'flex items-center justify-between px-3 py-2 hover:bg-slate-100 cursor-pointer rounded-lg transition group';
+                        div.innerHTML = `
+                            <div class="flex items-center space-x-2 truncate">
+                                <span>📁</span>
+                                <span class="font-medium text-slate-700 group-hover:text-movistar-700 truncate">${f.name}</span>
+                            </div>
+                            <span class="text-[10px] text-slate-400 font-mono">${t.openFolderText}</span>
+                        `;
+                        div.onclick = () => loadFolder(f.path);
+                        list.appendChild(div);
+                    });
+                }
+            });
+        }
+
+        // Apply detected language on initial load
+        applyLanguage(currentLang);
+
+        // Load root folder and begin polling
+        loadFolder('/data');
+        startPolling();
+    </script>
+</body>
+</html>
