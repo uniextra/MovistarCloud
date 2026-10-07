@@ -2,6 +2,8 @@ import os
 import signal
 import subprocess
 import threading
+from pathlib import Path
+import requests
 from flask import Flask, render_template, request, jsonify
 from vnc_helper import ensure_vnc_services, get_vnc_status
 
@@ -15,7 +17,71 @@ UPLOAD_LOCK = threading.Lock()
 UPLOAD_PROCESS = None
 UPLOAD_LOGS = []
 LOGIN_PROCESS = None
-ENV_PATH = "/app/.env"
+
+TOKENS_DIR = Path("/app/tokens")
+PRIMARY_ENV_PATH = TOKENS_DIR / ".env"
+FALLBACK_ENV_PATH = Path("/app/.env")
+
+def get_env_paths():
+    paths = []
+    if TOKENS_DIR.exists() or os.access("/app", os.W_OK):
+        try:
+            TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+            paths.append(PRIMARY_ENV_PATH)
+        except Exception:
+            pass
+    paths.append(FALLBACK_ENV_PATH)
+    paths.append(Path(".env"))
+    return paths
+
+def get_env_vars():
+    env_vars = os.environ.copy()
+    for p in get_env_paths():
+        if p.exists():
+            with open(p, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        env_vars[k.strip()] = v.strip().strip('"').strip("'")
+            break
+    return env_vars
+
+def save_env_vars(jsid, vkey):
+    content = f'MOVISTAR_JSESSIONID="{jsid}"\nMOVISTAR_VALIDATIONKEY="{vkey}"\n'
+    for p in get_env_paths():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception:
+            pass
+
+def keepalive_worker():
+    """Hilo demonio que realiza ping periódico a Movistar Cloud para evitar que JSESSIONID caduque por inactividad."""
+    import time
+    while True:
+        time.sleep(300)  # Cada 5 minutos
+        try:
+            env = get_env_vars()
+            jsid = env.get("MOVISTAR_JSESSIONID")
+            vk = env.get("MOVISTAR_VALIDATIONKEY")
+            if jsid and vk:
+                s = requests.Session()
+                s.cookies.set("JSESSIONID", jsid, domain="micloud.movistar.es", path="/")
+                s.cookies.set("validationkey", vk, domain="micloud.movistar.es", path="/")
+                s.headers.update({"User-Agent": "MovistarCloud-KeepAlive/1.0"})
+                url = f"https://micloud.movistar.es/sapi/system/information?action=get&validationkey={vk}"
+                r = s.get(url, timeout=15)
+                if r.status_code == 200:
+                    app.logger.debug("Keep-Alive heartbeat OK (sesión renovada).")
+                elif r.status_code == 401:
+                    app.logger.warning("Keep-Alive detectó sesión expirada (401).")
+        except Exception as e:
+            app.logger.debug(f"Keep-Alive ping error: {e}")
+
+KEEPALIVE_THREAD = threading.Thread(target=keepalive_worker, daemon=True)
+KEEPALIVE_THREAD.start()
 
 def kill_process_tree(proc):
     """
@@ -219,11 +285,12 @@ def start_login():
         LOGIN_PROCESS = None
             
     # Limpiar credenciales previas para que la detección sea limpia
-    if os.path.exists(ENV_PATH):
-        try:
-            os.remove(ENV_PATH)
-        except Exception:
-            pass
+    for p in get_env_paths():
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
 
     LOGIN_PROCESS = subprocess.Popen(
         ["python", "-u", "/app/movistar_login.py"],

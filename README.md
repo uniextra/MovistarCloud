@@ -26,10 +26,12 @@ A lifesaver for migrating from Google Photos. When enabled:
 - Reads the accompanying `*.json` sidecar files to extract the exact `photoTakenTime.timestamp`. This avoids the common issue where all exported photos receive today's upload timestamp.
 
 ### 🧠 Smart Duplicate Detection
-Queries the cloud gallery catalog prior to uploading, matching by exact filename and size. Resuming cancelled uploads is instantaneous and incurs zero unnecessary bandwidth.
+Queries the cloud gallery catalog prior to uploading using timeline batches, and caches all progress in a persistent native SQLite database (`/app/tokens/movistar_upload_cache.sqlite`). Resuming cancelled uploads is instantaneous and incurs zero unnecessary bandwidth.
 
 ### ⚡ Robust Architecture & Self-Healing
 - **Multi-threaded uploads**: Configurable parallel workers (1–10 threads).
+- **Persistent Session & SQLite Cache**: Named volume `/app/tokens` holds both credentials and upload history across container restarts.
+- **Session Keep-Alive Heartbeat**: Periodic background heartbeat ensures `JSESSIONID` stays alive indefinitely during massive multi-day migrations or idle periods.
 - **Self-Healing X11/VNC**: Services (`Xvfb`, `fluxbox`, `x11vnc`, `websockify`) auto-recover and self-initialize from Python even if run under custom container overrides.
 - **401 Hard-Fail**: Aborts immediately if session cookies expire mid-upload, preventing infinite error loops.
 
@@ -45,6 +47,7 @@ docker run -d \
   -p 5000:5000 \
   -p 8084:8084 \
   -v /ruta/a/tus/fotos:/data \
+  -v movistar_tokens:/app/tokens \
   uniextra/movistar-cloud:latest
 ```
 
@@ -63,6 +66,10 @@ services:
       - "8084:8084"   # Virtual Browser (VNC)
     volumes:
       - /path/to/your/photos:/data
+      - movistar_tokens:/app/tokens
+
+volumes:
+  movistar_tokens:
 ```
 
 ---

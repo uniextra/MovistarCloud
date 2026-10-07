@@ -103,14 +103,18 @@ def get_movistar_cookies():
         return jsessionid, validationkey
 
 def save_env(jsessionid, validationkey):
-    env_path = Path("/app/.env")
-    
     content = f"""# Movistar Cloud Session
 MOVISTAR_JSESSIONID="{jsessionid}"
 MOVISTAR_VALIDATIONKEY="{validationkey}"
 """
-    env_path.write_text(content, encoding='utf-8')
-    print(f"Archivo .env generado correctamente en: {env_path}", flush=True)
+    targets = [Path("/app/tokens/.env"), Path("/app/.env"), Path(".env")]
+    for t in targets:
+        try:
+            t.parent.mkdir(parents=True, exist_ok=True)
+            t.write_text(content, encoding='utf-8')
+            print(f"Archivo .env generado correctamente en: {t}", flush=True)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     jsessionid, validationkey = get_movistar_cookies()

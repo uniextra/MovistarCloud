@@ -49,8 +49,9 @@ class UploadCache:
     """
     Base de datos SQLite persistente para garantizar que ninguna foto o vídeo
     se vuelva a subir por duplicado, incluso tras reiniciar Docker o detener el proceso.
-    Incluye sincronización con mutex (threading.RLock), modo WAL con fallback,
-    timeout extendido (30s), busy timeout y reintentos ante bloqueos de filesystem/red.
+    Incluye sincronización con mutex (threading.RLock), PRAGMA busy_timeout (30s),
+    modo WAL con degradación a DELETE/NORMAL, creación garantizada de esquema,
+    fallback multinivel y recuperación automática de tablas.
     """
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -58,7 +59,29 @@ class UploadCache:
         self._conn = None
         self._init_db()
 
+    def _create_tables(self, conn: sqlite3.Connection):
+        """Crea las tablas e índices necesarios si no existen."""
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS uploaded_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    mtime REAL NOT NULL,
+                    cloud_id INTEGER,
+                    uploaded_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    UNIQUE(file_path, file_size)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
+
     def _open_connection(self, path: Path, timeout: float = 30.0) -> sqlite3.Connection:
+        if str(path) != ":memory:":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
         conn = sqlite3.connect(
             str(path),
             timeout=timeout,
@@ -66,30 +89,33 @@ class UploadCache:
         )
         conn.row_factory = sqlite3.Row
         
-        # Configuración de SQLite para máxima concurrencia y tolerancia a bloqueos
+        # Timeout de espera ante bloqueos concurrentes (30 segundos)
         busy_ms = int(timeout * 1000)
         try:
             conn.execute(f"PRAGMA busy_timeout = {busy_ms};")
         except Exception:
             pass
 
-        try:
-            # Modo WAL permite lecturas y escrituras concurrentes sin bloqueos de archivo
-            res = conn.execute("PRAGMA journal_mode = WAL;").fetchone()
-            mode = str(res[0]).upper() if res else ""
-            if mode != "WAL":
+        # Configurar modo de journal (WAL si es soportado por el FS, DELETE como respaldo)
+        if str(path) != ":memory:":
+            try:
+                res = conn.execute("PRAGMA journal_mode = WAL;").fetchone()
+                mode = str(res[0]).upper() if res else ""
+                if mode != "WAL":
+                    conn.execute("PRAGMA journal_mode = DELETE;")
+            except Exception:
                 try:
                     conn.execute("PRAGMA journal_mode = DELETE;")
                 except Exception:
                     pass
-        except Exception:
-            pass
 
         try:
             conn.execute("PRAGMA synchronous = NORMAL;")
         except Exception:
             pass
 
+        # CRÍTICO: Siempre asegurar que las tablas existen al abrir cualquier conexión
+        self._create_tables(conn)
         return conn
 
     def _get_conn(self, timeout: float = 30.0) -> sqlite3.Connection:
@@ -99,8 +125,15 @@ class UploadCache:
                 return self._conn
             except Exception:
                 self._close_conn()
-        self._conn = self._open_connection(self.db_path, timeout=timeout)
-        return self._conn
+        try:
+            self._conn = self._open_connection(self.db_path, timeout=timeout)
+            return self._conn
+        except Exception as e:
+            # Si la ruta actual falló (por ej. database is locked en bind-mount), activar fallback
+            self._close_conn()
+            fallback = self._activate_fallback(str(e))
+            self._conn = self._open_connection(fallback, timeout=timeout)
+            return self._conn
 
     def _close_conn(self):
         if self._conn is not None:
@@ -114,83 +147,57 @@ class UploadCache:
                 pass
             self._conn = None
 
+    def _activate_fallback(self, reason: str) -> Path:
+        candidates = [
+            Path("/app/tokens/movistar_upload_cache.sqlite"),
+            Path.home() / ".movistar_upload_cache.sqlite",
+            Path("/tmp/movistar_upload_cache.sqlite"),
+            Path(":memory:")
+        ]
+        for cand in candidates:
+            if cand != self.db_path:
+                try:
+                    if str(cand) != ":memory:":
+                        cand.parent.mkdir(parents=True, exist_ok=True)
+                    self.db_path = cand
+                    logging.getLogger("MovistarGallery").warning(
+                        f"Activando ruta de caché SQLite de respaldo: {cand} (Motivo: {reason})"
+                    )
+                    return cand
+                except Exception:
+                    continue
+        self.db_path = Path(":memory:")
+        return self.db_path
+
     def _init_db(self):
         with self._lock:
-            attempts = 2
-            last_err = None
+            attempts = 3
             for attempt in range(attempts):
                 try:
-                    self.db_path.parent.mkdir(parents=True, exist_ok=True)
-                    conn = self._get_conn(timeout=4.0)
-                    with conn:
-                        conn.execute("""
-                            CREATE TABLE IF NOT EXISTS uploaded_files (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                file_path TEXT NOT NULL,
-                                file_name TEXT NOT NULL,
-                                file_size INTEGER NOT NULL,
-                                mtime REAL NOT NULL,
-                                cloud_id INTEGER,
-                                uploaded_at TEXT NOT NULL,
-                                status TEXT NOT NULL,
-                                UNIQUE(file_path, file_size)
-                            )
-                        """)
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
-                    self._close_conn()
+                    conn = self._open_connection(self.db_path, timeout=5.0)
+                    self._create_tables(conn)
+                    conn.close()
                     logging.getLogger("MovistarGallery").info(f"Caché local persistente inicializada en: {self.db_path}")
                     return
                 except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-                    last_err = e
                     logging.getLogger("MovistarGallery").warning(
                         f"Intento {attempt + 1}/{attempts} de inicializar caché en {self.db_path} falló ({e}). Reintentando..."
                     )
-                    self._close_conn()
                     time.sleep(1.0)
                 except Exception as e:
-                    last_err = e
                     logging.getLogger("MovistarGallery").warning(f"Error inesperado inicializando caché en {self.db_path}: {e}")
                     break
 
-            # Fallback si el montaje de red o Docker bind mount en /data bloquea permanentemente SQLite
-            fallback_candidates = []
-            if Path("/tmp").exists() and os.access(Path("/tmp"), os.W_OK):
-                fallback_candidates.append(Path("/tmp/.movistar_upload_cache.sqlite"))
-            fallback_candidates.append(Path.home() / ".movistar_upload_cache.sqlite")
-
-            for fallback in fallback_candidates:
-                if self.db_path != fallback:
-                    logging.getLogger("MovistarGallery").warning(
-                        f"Activando ruta de caché de respaldo local en: {fallback} debido a bloqueo en {self.db_path} ({last_err})"
-                    )
-                    self.db_path = fallback
-                    self._close_conn()
-                    try:
-                        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-                        conn = self._get_conn(timeout=5.0)
-                        with conn:
-                            conn.execute("""
-                                CREATE TABLE IF NOT EXISTS uploaded_files (
-                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                    file_path TEXT NOT NULL,
-                                    file_name TEXT NOT NULL,
-                                    file_size INTEGER NOT NULL,
-                                    mtime REAL NOT NULL,
-                                    cloud_id INTEGER,
-                                    uploaded_at TEXT NOT NULL,
-                                    status TEXT NOT NULL,
-                                    UNIQUE(file_path, file_size)
-                                )
-                            """)
-                            conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
-                            conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
-                        self._close_conn()
-                        logging.getLogger("MovistarGallery").info(f"Caché de respaldo inicializada con éxito en: {self.db_path}")
-                        return
-                    except Exception as fb_err:
-                        logging.getLogger("MovistarGallery").warning(f"Fallback {fallback} también falló: {fb_err}")
-                        self._close_conn()
+            # Si falla la ruta configurada, activar ruta de respaldo
+            fallback = self._activate_fallback("bloqueo persistente o error de inicialización")
+            try:
+                conn = self._open_connection(fallback, timeout=5.0)
+                self._create_tables(conn)
+                conn.close()
+                logging.getLogger("MovistarGallery").info(f"Caché de respaldo inicializada con éxito en: {fallback}")
+            except Exception as fb_err:
+                logging.getLogger("MovistarGallery").error(f"Error inicializando respaldo {fallback}: {fb_err}")
+                self.db_path = Path(":memory:")
 
     def is_uploaded(self, path: Path) -> bool:
         with self._lock:
@@ -219,7 +226,11 @@ class UploadCache:
                             return True
                         return False
                     except sqlite3.OperationalError as e:
-                        if "locked" in str(e).lower() or "busy" in str(e).lower():
+                        err_msg = str(e).lower()
+                        if "no such table" in err_msg:
+                            self._create_tables(conn)
+                            continue
+                        if "locked" in err_msg or "busy" in err_msg:
                             time.sleep(0.1 * (attempt + 1))
                             continue
                         raise
@@ -251,7 +262,11 @@ class UploadCache:
                             """, (rel_path, name, size, mtime, cloud_id, now, status))
                         return
                     except sqlite3.OperationalError as e:
-                        if "locked" in str(e).lower() or "busy" in str(e).lower():
+                        err_msg = str(e).lower()
+                        if "no such table" in err_msg:
+                            self._create_tables(conn)
+                            continue
+                        if "locked" in err_msg or "busy" in err_msg:
                             time.sleep(0.1 * (attempt + 1))
                             continue
                         raise
@@ -279,7 +294,11 @@ class UploadCache:
                             """, rows)
                         return
                     except sqlite3.OperationalError as e:
-                        if "locked" in str(e).lower() or "busy" in str(e).lower():
+                        err_msg = str(e).lower()
+                        if "no such table" in err_msg:
+                            self._create_tables(conn)
+                            continue
+                        if "locked" in err_msg or "busy" in err_msg:
                             time.sleep(0.2 * (attempt + 1))
                             continue
                         raise
@@ -290,15 +309,54 @@ class UploadCache:
         with self._lock:
             self._close_conn()
 
-def get_cache_db_path(target_path: Path) -> Path:
-    data_dir = Path("/data")
-    if data_dir.exists() and os.access(data_dir, os.W_OK):
-        return data_dir / ".movistar_upload_cache.sqlite"
-    if target_path.is_dir() and os.access(target_path, os.W_OK):
-        return target_path / ".movistar_upload_cache.sqlite"
-    elif target_path.parent.exists() and os.access(target_path.parent, os.W_OK):
-        return target_path.parent / ".movistar_upload_cache.sqlite"
-    return Path.home() / ".movistar_upload_cache.sqlite"
+def get_cache_db_path(target_path: Path | None = None) -> Path:
+    """
+    Determina la mejor ruta persistente para la caché SQLite.
+    Prioridad:
+    1. MOVISTAR_CACHE_PATH de entorno si está definido
+    2. /app/tokens/movistar_upload_cache.sqlite (volumen ext4 dedicado de Docker)
+    3. ~/.movistar_upload_cache.sqlite (directorio home del sistema nativo)
+    4. /data/.movistar_upload_cache.sqlite (solo si no es bind-mount problemático)
+    """
+    custom = os.getenv("MOVISTAR_CACHE_PATH")
+    if custom:
+        return Path(custom).expanduser()
+
+    # 1. En Docker, /app/tokens es el volumen ext4 nativo persistente
+    tokens_dir = Path("/app/tokens")
+    try:
+        tokens_dir.mkdir(parents=True, exist_ok=True)
+        if os.access(tokens_dir, os.W_OK):
+            target_db = tokens_dir / "movistar_upload_cache.sqlite"
+            # Si existía una caché previa en /data, migrarla si no existe en tokens
+            old_data_cache = Path("/data/.movistar_upload_cache.sqlite")
+            if old_data_cache.exists() and not target_db.exists():
+                try:
+                    import shutil
+                    shutil.copy2(old_data_cache, target_db)
+                    logging.getLogger("MovistarGallery").info(
+                        f"Migrada base de datos de caché existente de {old_data_cache} a {target_db}"
+                    )
+                except Exception:
+                    pass
+            return target_db
+    except Exception:
+        pass
+
+    # 2. Directorio Home del usuario (C:\Users\... o /root en Linux)
+    home_db = Path.home() / ".movistar_upload_cache.sqlite"
+    try:
+        if os.access(Path.home(), os.W_OK):
+            return home_db
+    except Exception:
+        pass
+
+    # 3. /tmp local
+    tmp_dir = Path("/tmp")
+    if tmp_dir.exists() and os.access(tmp_dir, os.W_OK):
+        return tmp_dir / "movistar_upload_cache.sqlite"
+
+    return home_db
 
 # ---------------------------------------------------------
 # CONSTANTS & CONFIGURATION
@@ -449,48 +507,153 @@ class MovistarCloud:
         self.s.cookies.set("JSESSIONID", jsessionid, domain="micloud.movistar.es", path="/")
         self.s.cookies.set("validationkey", self.validation_key, domain="micloud.movistar.es", path="/")
 
+    def start_keepalive(self, interval_seconds: int = 300):
+        """Inicia un hilo en segundo plano que envía un heartbeat periódico a Movistar Cloud para evitar que JSESSIONID caduque."""
+        if hasattr(self, "_keepalive_thread") and self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            return
+        self._stop_keepalive = threading.Event()
+        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, args=(interval_seconds,), daemon=True)
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self, interval_seconds: int):
+        logger.debug(f"Keep-alive activo (heartbeat cada {interval_seconds}s).")
+        while not self._stop_keepalive.wait(interval_seconds):
+            try:
+                url = self._vk_url(f"{BASE_URL}/sapi/system/information?action=get")
+                r = self.s.get(url, timeout=15)
+                if r.status_code == 200:
+                    logger.debug("Keep-alive heartbeat OK (sesión renovada).")
+                elif r.status_code == 401:
+                    logger.warning("Keep-alive detectó sesión expirada en el servidor (401).")
+            except Exception as e:
+                logger.debug(f"Keep-alive ping error transitorio: {e}")
+
+    def stop_keepalive(self):
+        if hasattr(self, "_stop_keepalive"):
+            self._stop_keepalive.set()
+
     def get_all_gallery_items(self) -> dict:
         """
-        Fetches the complete gallery (pictures & videos) to prevent duplicate uploads.
-        Movistar uses pagination/limits. We request up to 50000 items.
+        Obtiene el inventario completo de la Galería de Movistar Cloud para evitar duplicados.
+        Utiliza el endpoint oficial de línea de tiempo (/sapi/media/timeline?action=get)
+        y consulta de metadatos en bloques por IDs, con fallback directo a /sapi/media?action=get.
         """
         logger.info("Obteniendo inventario de la Galería en Movistar Cloud para control de duplicados...")
         existing_items = {}
-        
-        for media_type in ["picture", "video"]:
-            url = self._vk_url(f"{BASE_URL}/sapi/media/{media_type}?action=get&limit=50000")
+
+        # Estrategia 1: Timeline oficial (/sapi/media/timeline?action=get)
+        try:
+            timeline_url = self._vk_url(f"{BASE_URL}/sapi/media/timeline?action=get")
             payload = {
                 "data": {
-                    # Traemos size y origin para identificar correctamente la foto
+                    "granularity": "daily",
+                    "sortorder": "creationdate"
+                }
+            }
+            r = self.s.post(timeline_url, json=payload, timeout=self.timeout)
+            if r.status_code == 200:
+                data_obj = r.json().get("data", {})
+                periods = data_obj.get("periods") or []
+                all_ids = []
+                for p in periods:
+                    if isinstance(p, dict) and "ids" in p:
+                        all_ids.extend(p["ids"])
+                
+                if all_ids:
+                    logger.info(f"Timeline reporta {len(all_ids)} elementos en la cuenta. Cargando metadatos en bloques...")
+                    chunk_size = 400
+                    for i in range(0, len(all_ids), chunk_size):
+                        chunk = all_ids[i:i + chunk_size]
+                        items_url = self._vk_url(f"{BASE_URL}/sapi/media?action=get")
+                        items_payload = {
+                            "data": {
+                                "ids": chunk,
+                                "fields": ["name", "size", "folderid", "creationdate"]
+                            }
+                        }
+                        try:
+                            ir = self.s.post(items_url, json=items_payload, timeout=self.timeout)
+                            if ir.status_code == 200:
+                                media_list = ir.json().get("data", {}).get("media") or []
+                                for item in media_list:
+                                    name = item.get("name") or item.get("filename")
+                                    size = item.get("size") or item.get("filesize") or item.get("bytes")
+                                    if name is not None and size is not None:
+                                        existing_items[(name, int(size))] = item
+                                        existing_items[(name.lower(), int(size))] = item
+                        except Exception as chunk_err:
+                            logger.debug(f"Aviso consultando bloque de metadatos: {chunk_err}")
+
+                    logger.info(f"Inventario en la nube cargado vía Timeline: {len(existing_items) // 2} elementos únicos.")
+                    return existing_items
+        except Exception as e:
+            logger.debug(f"Estrategia Timeline no disponible ({e}), probando alternativas...")
+
+        # Estrategia 2: Endpoint unificado /sapi/media?action=get
+        try:
+            url = self._vk_url(f"{BASE_URL}/sapi/media?action=get&limit=5000")
+            payload = {
+                "data": {
                     "fields": ["name", "size", "folder", "origin"]
                 }
             }
+            r = None
             try:
                 r = self.s.post(url, json=payload, timeout=self.timeout)
-                r.raise_for_status()
-                data_obj = r.json().get("data", {})
-                
-                key = "pictures" if media_type == "picture" else "videos"
-                items = []
-                for k in [key, media_type, "items", "elements", "media", "files"]:
-                    if k in data_obj and isinstance(data_obj[k], list):
-                        items = data_obj[k]
-                        break
-                if not items and isinstance(r.json(), list):
-                    items = r.json()
+            except requests.exceptions.HTTPError as he:
+                if he.response is not None and he.response.status_code == 405:
+                    r = self.s.get(url, timeout=self.timeout)
+                else:
+                    raise
 
+            if r is not None and r.status_code == 405:
+                r = self.s.get(url, timeout=self.timeout)
+
+            if r is not None and r.status_code == 200:
+                data_obj = r.json().get("data", {})
+                items = data_obj.get("media") or data_obj.get("items") or data_obj.get("files") or []
                 for item in items:
                     name = item.get("name") or item.get("filename")
                     size = item.get("size") or item.get("filesize") or item.get("bytes")
                     if name is not None and size is not None:
-                        # Composite key: (filename, filesize) y versión en minúsculas
                         existing_items[(name, int(size))] = item
                         existing_items[(name.lower(), int(size))] = item
-                        
-            except Exception as e:
-                logger.warning(f"Aviso al cargar inventario de {media_type}: {e}")
 
-        logger.info(f"Inventario en la nube: {len(existing_items)} elementos detectados en la cuenta.")
+                if existing_items:
+                    logger.info(f"Inventario en la nube cargado vía sapi/media: {len(existing_items) // 2} elementos únicos.")
+                    return existing_items
+        except Exception as e:
+            logger.debug(f"Estrategia unificada no disponible: {e}")
+
+        # Estrategia 3: Endpoints específicos con soporte GET y POST
+        for media_type in ["picture", "video"]:
+            try:
+                url = self._vk_url(f"{BASE_URL}/sapi/media/{media_type}?action=get&limit=5000")
+                r = self.s.get(url, timeout=self.timeout)
+                if r.status_code == 405:
+                    r = self.s.post(url, json={"data": {"fields": ["name", "size"]}}, timeout=self.timeout)
+                
+                if r.status_code == 200:
+                    data_obj = r.json().get("data", {})
+                    key = "pictures" if media_type == "picture" else "videos"
+                    items = []
+                    for k in [key, media_type, "items", "elements", "media", "files"]:
+                        if k in data_obj and isinstance(data_obj[k], list):
+                            items = data_obj[k]
+                            break
+                    for item in items:
+                        name = item.get("name") or item.get("filename")
+                        size = item.get("size") or item.get("filesize") or item.get("bytes")
+                        if name is not None and size is not None:
+                            existing_items[(name, int(size))] = item
+                            existing_items[(name.lower(), int(size))] = item
+            except Exception as e:
+                logger.debug(f"Aviso consultando inventario de {media_type}: {e}")
+
+        if existing_items:
+            logger.info(f"Inventario en la nube: {len(existing_items) // 2} elementos detectados.")
+        else:
+            logger.info("Inventario en la nube no devolvió elementos previos (se continuará usando la base de datos local SQLite persistente).")
         return existing_items
 
     def upload_to_gallery(self, path: Path, is_takeout: bool = False) -> dict:
@@ -583,8 +746,8 @@ def main() -> int:
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
-    # Intentar cargar .env desde la carpeta donde está el script o desde el directorio actual
-    env_paths = [Path(__file__).parent / ".env", Path.cwd() / ".env"]
+    # Intentar cargar .env desde volumen de tokens, carpeta local o actual
+    env_paths = [Path("/app/tokens/.env"), Path(__file__).parent / ".env", Path.cwd() / ".env", Path.home() / ".env"]
     for ep in env_paths:
         if ep.exists():
             logger.debug(f"Cargando variables de entorno desde {ep}")
@@ -639,6 +802,7 @@ def main() -> int:
     try:
         mc.login()
         logger.info("Login correcto.")
+        mc.start_keepalive(interval_seconds=300)
         
         # Inicializar base de datos de caché persistente (local al volumen)
         cache_path = get_cache_db_path(path)
@@ -722,9 +886,11 @@ def main() -> int:
         return 1 if failed else 0
 
     finally:
+        if 'mc' in locals() and mc is not None:
+            mc.stop_keepalive()
+            mc.s.close()
         if 'cache' in locals() and cache is not None:
             cache.close()
-        mc.s.close()
 
 
 if __name__ == "__main__":

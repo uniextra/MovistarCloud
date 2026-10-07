@@ -29,7 +29,7 @@ COPY . /app/
 # Script de arranque: garantizar terminaciones LF y permisos de ejecución
 RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 
-VOLUME ["/data"]
+VOLUME ["/data", "/app/tokens"]
 
 # 5000: Web App, 8084: noVNC
 EXPOSE 5000 8084
