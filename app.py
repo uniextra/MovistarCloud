@@ -21,6 +21,8 @@ LOGIN_PROCESS = None
 TOKENS_DIR = Path("/app/tokens")
 PRIMARY_ENV_PATH = TOKENS_DIR / ".env"
 FALLBACK_ENV_PATH = Path("/app/.env")
+ENV_PATH = PRIMARY_ENV_PATH
+ENV_PATHS = [PRIMARY_ENV_PATH, FALLBACK_ENV_PATH, Path(".env")]
 
 def get_env_paths():
     paths = []
@@ -37,14 +39,17 @@ def get_env_paths():
 def get_env_vars():
     env_vars = os.environ.copy()
     for p in get_env_paths():
-        if p.exists():
-            with open(p, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        k, v = line.split('=', 1)
-                        env_vars[k.strip()] = v.strip().strip('"').strip("'")
-            break
+        try:
+            if p.exists() and p.is_file():
+                with open(p, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            k, v = line.split('=', 1)
+                            env_vars[k.strip()] = v.strip().strip('"').strip("'")
+                break
+        except Exception:
+            pass
     return env_vars
 
 def save_env_vars(jsid, vkey):
@@ -138,21 +143,9 @@ def read_upload_logs(proc):
             if UPLOAD_PROCESS == proc:
                 UPLOAD_PROCESS = None
 
-def get_env_vars():
-    env_vars = os.environ.copy()
-    if os.path.exists(ENV_PATH):
-        with open(ENV_PATH, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    k, v = line.split('=', 1)
-                    env_vars[k.strip()] = v.strip().strip('"').strip("'")
-    return env_vars
-
-def save_env_vars(jsid, vkey):
-    with open(ENV_PATH, 'w', encoding='utf-8') as f:
-        f.write(f'MOVISTAR_JSESSIONID="{jsid}"\n')
-        f.write(f'MOVISTAR_VALIDATIONKEY="{vkey}"\n')
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 @app.route("/")
 def index():
