@@ -4,7 +4,7 @@ import subprocess
 import threading
 from pathlib import Path
 import requests
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_from_directory
 from vnc_helper import ensure_vnc_services, get_vnc_status
 
 # Inicialización autónoma de los servicios gráficos VNC/X11
@@ -146,6 +146,10 @@ def read_upload_logs(proc):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+@app.route("/favicon.ico")
+def favicon():
+    return send_from_directory(os.path.join(app.root_path, "static"), "favicon.ico", mimetype="image/vnd.microsoft.icon")
 
 @app.route("/")
 def index():
