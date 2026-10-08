@@ -475,10 +475,30 @@ class MovistarCloud:
         sep = "&" if "?" in url else "?"
         return f"{url}{sep}validationkey={requests.utils.quote(self.validation_key or '', safe='')}"
 
+    def validate_session(self) -> bool:
+        """Verifica activamente contra la API de Movistar Cloud que las credenciales/cookies son válidas."""
+        url = self._vk_url(f"{BASE_URL}/sapi/system/information?action=get")
+        try:
+            r = self.s.get(url, timeout=15)
+            if r.status_code == 200:
+                return True
+            elif r.status_code == 401:
+                logger.error("Sesión inválida o caducada en Movistar Cloud (Error 401 Unauthorized).")
+                return False
+            else:
+                logger.warning(f"Respuesta inesperada al validar sesión (HTTP {r.status_code}). Continuando...")
+                return True
+        except Exception as e:
+            logger.warning(f"Aviso al validar sesión con el servidor ({e}). Continuando...")
+            return True
+
     def login(self) -> None:
-        """Logs in via email/password if cookies were not provided."""
+        """Valida la sesión o autentica mediante email/password."""
         if self.s.cookies.get("JSESSIONID") and self.validation_key:
-            logger.debug("Utilizando sesión pre-inyectada (cookies).")
+            logger.info("Comprobando credenciales y estado de sesión en Movistar Cloud...")
+            if not self.validate_session():
+                die("La sesión de Movistar Cloud ha caducado o las credenciales no son válidas. Por favor, renueva el inicio de sesión desde el panel web.")
+            logger.info("¡Sesión en Movistar Cloud verificada con éxito! Conexión lista.")
             return
             
         if not self.email or not self.password:
@@ -772,49 +792,56 @@ def main() -> int:
     if not path.exists():
         die(f"No existe: {path}")
 
-    all_files = list(iter_media_files(path, args.recursive))
-    
-    # Filtrado especial Takeout
-    if args.takeout:
-        logger.info("Modo Takeout activado: Filtrando miniaturas y leyendo .json")
-        # Filtramos ficheros que ocupen menos de 40KB o tengan 'thumbnail' en el nombre
-        files = [
-            f for f in all_files 
-            if f.stat().st_size > 40960 and "thumbnail" not in f.name.lower()
-        ]
-        discarded = len(all_files) - len(files)
-        if discarded > 0:
-            logger.info(f"Takeout: Se han descartado {discarded} posibles miniaturas automáticamente.")
-    else:
-        files = all_files
-
-    if not files:
-        die("No se encontraron fotos/vídeos en la ruta proporcionada (o todas fueron filtradas como miniaturas).")
-
-    if args.dry_run:
-        logger.info("Modo Dry-Run activo. Archivos que se procesarían:")
-        for p in files:
-            logger.info(f"- {p} | {mime_for(p)} | {capture_time(p, is_takeout=args.takeout)}")
-        return 0
-
+    # 1. Validar sesión y conectar con Movistar Cloud de inmediato
     mc = MovistarCloud(email, password, jsessionid, validationkey)
 
     try:
         mc.login()
-        logger.info("Login correcto.")
         mc.start_keepalive(interval_seconds=300)
         
-        # Inicializar base de datos de caché persistente (local al volumen)
+        # 2. Inicializar base de datos de caché persistente (en volumen seguro)
         cache_path = get_cache_db_path(path)
         cache = UploadCache(cache_path)
         global _GLOBAL_CACHE
         _GLOBAL_CACHE = cache
         atexit.register(lambda: _GLOBAL_CACHE.close() if _GLOBAL_CACHE else None)
 
-        # Obtenemos TODOS los items de galería para detectar duplicados
+        # 3. Obtenemos inventario de galería en la nube para control de duplicados
         existing_items = mc.get_all_gallery_items()
         cache.import_cloud_items(existing_items)
+
+        # 4. Explorar archivos multimedia locales con reporte periódico
+        logger.info(f"Explorando archivos multimedia en {path} (recursivo={args.recursive})...")
+        sys.stdout.flush()
+        all_files = []
+        for count, p in enumerate(iter_media_files(path, args.recursive), 1):
+            all_files.append(p)
+            if count % 10000 == 0:
+                logger.info(f"Escaneados {count} archivos multimedia...")
+                sys.stdout.flush()
         
+        # Filtrado especial Takeout
+        if args.takeout:
+            logger.info("Modo Takeout activado: Filtrando miniaturas y leyendo .json")
+            files = [
+                f for f in all_files 
+                if f.stat().st_size > 40960 and "thumbnail" not in f.name.lower()
+            ]
+            discarded = len(all_files) - len(files)
+            if discarded > 0:
+                logger.info(f"Takeout: Se han descartado {discarded} posibles miniaturas automáticamente.")
+        else:
+            files = all_files
+
+        if not files:
+            die("No se encontraron fotos/vídeos en la ruta proporcionada (o todas fueron filtradas como miniaturas).")
+
+        if args.dry_run:
+            logger.info("Modo Dry-Run activo. Archivos que se procesarían:")
+            for p in files:
+                logger.info(f"- {p} | {mime_for(p)} | {capture_time(p, is_takeout=args.takeout)}")
+            return 0
+
         total_size_mb = sum(p.stat().st_size for p in files) / (1024 * 1024)
         logger.info(f"Archivos a subir: {len(files)} (Total: {total_size_mb:.2f} MB)")
 
