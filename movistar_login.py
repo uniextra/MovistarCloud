@@ -102,12 +102,35 @@ def get_movistar_cookies():
         browser.close()
         return jsessionid, validationkey
 
-def save_env(jsessionid, validationkey):
+import argparse
+import re
+
+def sanitize_phone(phone: str) -> str:
+    if not phone:
+        return ""
+    digits = re.sub(r"\D", "", str(phone).strip())
+    if len(digits) == 11 and digits.startswith("34"):
+        digits = digits[2:]
+    return digits
+
+def save_env(jsessionid, validationkey, phone=None):
+    phone_clean = sanitize_phone(phone)
     content = f"""# Movistar Cloud Session
 MOVISTAR_JSESSIONID="{jsessionid}"
 MOVISTAR_VALIDATIONKEY="{validationkey}"
 """
-    targets = [Path("/app/tokens/.env"), Path("/app/.env"), Path(".env")]
+    if phone_clean:
+        content += f'MOVISTAR_PHONE="{phone_clean}"\n'
+
+    targets = []
+    if phone_clean:
+        targets.extend([
+            Path(f"/app/tokens/account_{phone_clean}.env"),
+            Path(f"/app/tokens/{phone_clean}.env"),
+            Path(f"/app/.env_{phone_clean}"),
+        ])
+    targets.extend([Path("/app/tokens/.env"), Path("/app/.env"), Path(".env")])
+
     for t in targets:
         try:
             t.parent.mkdir(parents=True, exist_ok=True)
@@ -117,9 +140,13 @@ MOVISTAR_VALIDATIONKEY="{validationkey}"
             pass
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--phone", type=str, default=None, help="Número de teléfono móvil asociado")
+    args, _ = parser.parse_known_args()
+
     jsessionid, validationkey = get_movistar_cookies()
     if jsessionid and validationkey:
-        save_env(jsessionid, validationkey)
+        save_env(jsessionid, validationkey, phone=args.phone)
         print("Ya puedes ejecutar el script de subida. ¡Tus credenciales están listas!", flush=True)
     else:
         print("No se pudo obtener la sesión.", flush=True)

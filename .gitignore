@@ -29,3 +29,7 @@ __pycache__/
 
 # Movistar specific
 .movistar-cloud-device-id
+*.sqlite
+*.sqlite*
+migrate_*.py
+migrate*

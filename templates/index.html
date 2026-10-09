@@ -66,6 +66,12 @@
 
             <!-- Server, Session Status & Language Switcher -->
             <div class="flex items-center space-x-3 sm:space-x-4">
+                <div id="account-pill" class="hidden flex items-center space-x-2 px-3 py-1.5 bg-movistar-50 text-movistar-800 border border-movistar-200 rounded-lg text-xs font-medium">
+                    <span>📱</span>
+                    <span id="account-phone-text" class="font-mono font-bold">---</span>
+                    <button onclick="promptSwitchAccount()" class="text-movistar-600 hover:text-movistar-800 underline text-[11px] ml-1" data-i18n="switchAccount">Cambiar</button>
+                </div>
+
                 <div id="session-badge" class="hidden sm:flex items-center space-x-2 px-3 py-1.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-medium">
                     <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
                     <span id="session-status-text" data-i18n="sessionNotDetected">Sesión no detectada</span>
@@ -84,8 +90,44 @@
         </div>
     </header>
 
+    <!-- Phone Gate Modal (Account Lock & Separation) -->
+    <div id="phoneGateModal" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-md p-4 transition-all">
+        <div class="bg-white rounded-3xl shadow-2xl max-w-md w-full p-7 space-y-6 border border-slate-100">
+            <div class="text-center space-y-2.5">
+                <div class="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-tr from-movistar-700 to-movistar-500 flex items-center justify-center text-white shadow-xl shadow-movistar-500/30">
+                    <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"></path>
+                    </svg>
+                </div>
+                <h3 class="text-xl font-bold text-slate-900 tracking-tight" data-i18n="gateTitle">Acceso a Cuenta Movistar Cloud</h3>
+                <p class="text-xs text-slate-500 leading-relaxed max-w-sm mx-auto" data-i18n="gateSubtitle">Introduce tu número de teléfono móvil para acceder a tu sesión o consultar la subida en curso:</p>
+            </div>
+            
+            <form id="phoneGateForm" onsubmit="handlePhoneGateSubmit(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-semibold text-slate-700 mb-1.5" data-i18n="gateInputLabel">Número de teléfono móvil</label>
+                    <div class="relative">
+                        <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center text-slate-400 text-sm">📱</span>
+                        <input id="gatePhoneInput" type="tel" autofocus required placeholder="ej. 622151801" 
+                               class="w-full pl-10 pr-3.5 py-3 text-base font-mono font-medium border border-slate-300 rounded-xl focus:ring-2 focus:ring-movistar-500 focus:border-movistar-500 outline-none transition placeholder:text-slate-400 placeholder:font-normal">
+                    </div>
+                    <p id="gatePhoneError" class="hidden text-xs text-rose-600 mt-2 font-medium"></p>
+                </div>
+
+                <div id="gateActiveNotice" class="hidden p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 leading-relaxed">
+                    <span class="font-bold">Aviso:</span> Hay una subida en curso en el servidor. Si pertenece a este número, se conectará en vivo.
+                </div>
+
+                <button type="submit" id="gateSubmitBtn" class="w-full py-3 px-4 bg-movistar-600 hover:bg-movistar-700 text-white font-semibold rounded-xl text-sm shadow-lg shadow-movistar-600/25 transition flex items-center justify-center space-x-2 active:scale-[0.99]">
+                    <span data-i18n="gateSubmit">Acceder a la Cuenta</span>
+                    <span>➔</span>
+                </button>
+            </form>
+        </div>
+    </div>
+
     <!-- Main Workspace -->
-    <main class="flex-1 w-full max-w-[1800px] mx-auto px-3 sm:px-6 lg:px-8 py-5 space-y-5">
+    <main id="mainWorkspace" class="hidden flex-1 w-full max-w-[1800px] mx-auto px-3 sm:px-6 lg:px-8 py-5 space-y-5 transition-opacity duration-300">
 
         <!-- Top Grid: Credentials & Upload Settings -->
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -373,7 +415,13 @@ Esperando inicio del proceso de subida...
                 emptyFolderText: "No hay más subcarpetas aquí",
                 openFolderText: "Abrir ➔",
                 missingCredsAlert: "Por favor introduce las credenciales o abre el Navegador Virtual primero.",
-                sessionCapturedAlert: "¡Sesión capturada con éxito en Movistar Cloud!"
+                sessionCapturedAlert: "¡Sesión capturada con éxito en Movistar Cloud!",
+                gateTitle: "Acceso a Cuenta Movistar Cloud",
+                gateSubtitle: "Introduce tu número de teléfono móvil para acceder a tu sesión o consultar la subida en curso:",
+                gateInputLabel: "Número de teléfono móvil",
+                gateSubmit: "Acceder a la Cuenta",
+                switchAccount: "Cambiar",
+                anotherRunningNotice: "Aviso: Hay una subida en curso para otra cuenta en el servidor."
             },
             en: {
                 appSubtitle: "Bulk native Gallery sync tool (Android API)",
@@ -419,7 +467,13 @@ Esperando inicio del proceso de subida...
                 emptyFolderText: "No more subfolders here",
                 openFolderText: "Open ➔",
                 missingCredsAlert: "Please enter your credentials or open the Virtual Browser first.",
-                sessionCapturedAlert: "Session successfully captured from Movistar Cloud!"
+                sessionCapturedAlert: "Session successfully captured from Movistar Cloud!",
+                gateTitle: "Movistar Cloud Account Access",
+                gateSubtitle: "Enter your mobile phone number to access your session or monitor an ongoing upload:",
+                gateInputLabel: "Mobile phone number",
+                gateSubmit: "Access Account",
+                switchAccount: "Switch",
+                anotherRunningNotice: "Notice: An upload is currently running for another account on the server."
             }
         };
 
@@ -494,12 +548,110 @@ Esperando inicio del proceso de subida...
             }
         }
 
+        let currentPhone = "";
         let isUploading = false;
         let isCancelling = false;
         let logInterval = null;
         let envPollInterval = null;
 
+        function handlePhoneGateSubmit(e) {
+            if (e) e.preventDefault();
+            const input = document.getElementById('gatePhoneInput');
+            const phone = input.value.trim().replace(/\D/g, '');
+            const errElem = document.getElementById('gatePhoneError');
+            const submitBtn = document.getElementById('gateSubmitBtn');
+
+            if (!phone || phone.length < 6) {
+                errElem.textContent = (currentLang === 'es') ? 
+                    'Por favor introduce un número de teléfono válido (mínimo 6 dígitos).' : 
+                    'Please enter a valid phone number (at least 6 digits).';
+                errElem.classList.remove('hidden');
+                return;
+            }
+
+            errElem.classList.add('hidden');
+            submitBtn.disabled = true;
+
+            fetch('/verify_phone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone })
+            })
+            .then(r => r.json())
+            .then(data => {
+                submitBtn.disabled = false;
+                if (data.status === 'ok') {
+                    currentPhone = data.phone;
+                    
+                    // Actualizar cabecera con el teléfono activo
+                    document.getElementById('account-phone-text').textContent = currentPhone;
+                    document.getElementById('account-pill').classList.remove('hidden');
+
+                    // Asignar credenciales de este usuario
+                    document.getElementById('jsessionid').value = data.jsessionid || '';
+                    document.getElementById('validationkey').value = data.validationkey || '';
+                    updateSessionBadge();
+
+                    // Ocultar modal de bloqueo y revelar workspace
+                    document.getElementById('phoneGateModal').classList.add('hidden');
+                    const main = document.getElementById('mainWorkspace');
+                    main.classList.remove('hidden');
+
+                    if (data.another_running) {
+                        const notice = (currentLang === 'es') ? 
+                            `Aviso: El servidor está ejecutando actualmente una subida para el número ${data.active_running_phone}. No se pueden subir dos cuentas en paralelo; podrás iniciar esta cuenta cuando la anterior finalice.` : 
+                            `Notice: An upload is currently running for account ${data.active_running_phone}. You cannot run two accounts in parallel; you will be able to start once it completes.`;
+                        alert(notice);
+                    }
+
+                    // Cargar explorador de carpetas e iniciar lectura de logs
+                    loadFolder('/data');
+                    startPolling();
+                } else {
+                    errElem.textContent = data.message || 'Error al verificar el teléfono.';
+                    errElem.classList.remove('hidden');
+                }
+            })
+            .catch(err => {
+                submitBtn.disabled = false;
+                errElem.textContent = 'Error de conexión con el servidor.';
+                errElem.classList.remove('hidden');
+            });
+        }
+
+        function promptSwitchAccount() {
+            if (isUploading) {
+                const confirmSwitch = confirm((currentLang === 'es') ? 
+                    'Hay una subida en curso para esta cuenta. ¿Deseas salir a la pantalla de selección de cuenta? (El proceso seguirá subiendo en segundo plano)' : 
+                    'An upload is currently in progress for this account. Do you want to return to account selection? (The process will keep running on the server)');
+                if (!confirmSwitch) return;
+            }
+            
+            currentPhone = "";
+            if (logInterval) { clearInterval(logInterval); logInterval = null; }
+            if (envPollInterval) { clearInterval(envPollInterval); envPollInterval = null; }
+
+            // Ocultar workspace y credenciales
+            document.getElementById('account-pill').classList.add('hidden');
+            document.getElementById('account-phone-text').textContent = '---';
+            document.getElementById('mainWorkspace').classList.add('hidden');
+            document.getElementById('jsessionid').value = '';
+            document.getElementById('validationkey').value = '';
+            updateSessionBadge();
+
+            // Mostrar modal de acceso
+            document.getElementById('gatePhoneInput').value = '';
+            document.getElementById('gatePhoneError').classList.add('hidden');
+            document.getElementById('phoneGateModal').classList.remove('hidden');
+            document.getElementById('gatePhoneInput').focus();
+        }
+
         function startUpload() {
+            if (!currentPhone) {
+                promptSwitchAccount();
+                return;
+            }
+
             const path = document.getElementById('path').value;
             const jsessionid = document.getElementById('jsessionid').value;
             const validationkey = document.getElementById('validationkey').value;
@@ -528,9 +680,18 @@ Esperando inicio del proceso de subida...
             fetch('/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path, jsessionid, validationkey, workers, recursive, takeout })
+                body: JSON.stringify({ 
+                    phone: currentPhone, 
+                    path, 
+                    jsessionid, 
+                    validationkey, 
+                    workers, 
+                    recursive, 
+                    takeout 
+                })
             }).then(res => res.json()).then(data => {
                 if (data.status === 'ok') {
+                    isUploading = true;
                     startPolling();
                 } else {
                     alert(data.message);
@@ -550,22 +711,26 @@ Esperando inicio del proceso de subida...
             const t = translations[currentLang] || translations.en;
             isCancelling = true;
 
-            // Feedback visual INMEDIATO al hacer clic en Cancelar
             const startBtn = document.getElementById('startBtn');
             const stopBtn = document.getElementById('stopBtn');
             startBtn.disabled = true;
             stopBtn.disabled = true;
             document.getElementById('progress-status-label').textContent = t.cancellingStatus;
 
-            fetch('/stop', { method: 'POST' })
-                .then(res => res.json())
-                .then(data => {
-                    fetchLogs();
-                })
-                .catch(err => {
-                    console.error("Error al cancelar:", err);
-                    fetchLogs();
-                });
+            fetch('/stop', { 
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: currentPhone })
+            })
+            .then(res => res.json())
+            .then(data => {
+                isUploading = false;
+                fetchLogs();
+            })
+            .catch(err => {
+                console.error("Error al cancelar:", err);
+                fetchLogs();
+            });
         }
 
         function startPolling() {
@@ -575,9 +740,25 @@ Esperando inicio del proceso de subida...
         }
 
         function fetchLogs() {
+            if (!currentPhone) return;
             const t = translations[currentLang] || translations.en;
-            fetch('/logs').then(res => res.json()).then(data => {
+            fetch('/logs?phone=' + encodeURIComponent(currentPhone)).then(res => res.json()).then(data => {
                 const logsElem = document.getElementById('logs');
+                const startBtn = document.getElementById('startBtn');
+                const stopBtn = document.getElementById('stopBtn');
+
+                if (data.another_running) {
+                    startBtn.disabled = true;
+                    stopBtn.disabled = true;
+                    document.getElementById('progress-status-label').textContent = (currentLang === 'es') ? 
+                        `Subida activa para otra cuenta (${data.active_running_phone})` : 
+                        `Upload active for another account (${data.active_running_phone})`;
+                    if (data.logs && data.logs.length > 0) {
+                        logsElem.textContent = data.logs.join('\n');
+                    }
+                    return;
+                }
+
                 if (data.logs && data.logs.length > 0) {
                     logsElem.textContent = data.logs.join('\n');
                     logsElem.scrollTop = logsElem.scrollHeight;
@@ -619,9 +800,8 @@ Esperando inicio del proceso de subida...
                     });
                 }
 
-                const startBtn = document.getElementById('startBtn');
-                const stopBtn = document.getElementById('stopBtn');
                 const isRunning = Boolean(data.is_running || data.running);
+                isUploading = isRunning;
 
                 if (isRunning) {
                     if (isCancelling) {
@@ -652,26 +832,25 @@ Esperando inicio del proceso de subida...
             });
         }
 
-        // Recover stored credentials
-        if (!document.getElementById('jsessionid').value) {
-            document.getElementById('jsessionid').value = localStorage.getItem('movistar_jsid') || '';
-        }
-        if (!document.getElementById('validationkey').value) {
-            document.getElementById('validationkey').value = localStorage.getItem('movistar_vkey') || '';
-        }
-
-        document.getElementById('jsessionid').addEventListener('input', (e) => {
-            localStorage.setItem('movistar_jsid', e.target.value);
+        document.getElementById('jsessionid').addEventListener('input', () => {
             updateSessionBadge();
         });
-        document.getElementById('validationkey').addEventListener('input', (e) => {
-            localStorage.setItem('movistar_vkey', e.target.value);
+        document.getElementById('validationkey').addEventListener('input', () => {
             updateSessionBadge();
         });
 
         // Expansive VNC Modal Management
         function openVncModal() {
-            fetch('/start_login', { method: 'POST' });
+            if (!currentPhone) {
+                promptSwitchAccount();
+                return;
+            }
+
+            fetch('/start_login', { 
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: currentPhone })
+            });
             
             const host = window.location.hostname;
             const vncPort = document.getElementById('vnc-port').value || 8084;
@@ -694,15 +873,14 @@ Esperando inicio del proceso de subida...
         }
 
         function pollEnv() {
+            if (!currentPhone) return;
             const t = translations[currentLang] || translations.en;
-            fetch('/env')
+            fetch('/env?phone=' + encodeURIComponent(currentPhone))
             .then(res => res.json())
             .then(data => {
                 if (data.jsessionid && data.validationkey) {
                     document.getElementById('jsessionid').value = data.jsessionid;
                     document.getElementById('validationkey').value = data.validationkey;
-                    localStorage.setItem('movistar_jsid', data.jsessionid);
-                    localStorage.setItem('movistar_vkey', data.validationkey);
                     updateSessionBadge();
                     
                     closeVncModal();
@@ -756,9 +934,11 @@ Esperando inicio del proceso de subida...
         // Apply detected language on initial load
         applyLanguage(currentLang);
 
-        // Load root folder and begin polling
-        loadFolder('/data');
-        startPolling();
+        // Autofocus phone gate on load
+        setTimeout(() => {
+            const gateInput = document.getElementById('gatePhoneInput');
+            if (gateInput) gateInput.focus();
+        }, 100);
     </script>
 </body>
 </html>

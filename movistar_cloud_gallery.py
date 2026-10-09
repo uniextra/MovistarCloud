@@ -309,15 +309,18 @@ class UploadCache:
         with self._lock:
             self._close_conn()
 
-def get_cache_db_path(target_path: Path | None = None) -> Path:
+def get_cache_db_path(target_path: Path | None = None, phone: str | None = None) -> Path:
     """
-    Determina la mejor ruta persistente para la caché SQLite.
+    Determina la ruta persistente para la caché SQLite, aislada por número móvil si se proporciona.
     Prioridad:
     1. MOVISTAR_CACHE_PATH de entorno si está definido
-    2. /app/tokens/movistar_upload_cache.sqlite (volumen ext4 dedicado de Docker)
-    3. ~/.movistar_upload_cache.sqlite (directorio home del sistema nativo)
-    4. /data/.movistar_upload_cache.sqlite (solo si no es bind-mount problemático)
+    2. /app/tokens/cache_{phone}.sqlite (volumen ext4 dedicado de Docker)
+    3. ~/.cache_{phone}.sqlite (directorio home del sistema)
+    4. target_path o /data
     """
+    phone_clean = "".join(filter(str.isdigit, str(phone or "")))
+    db_name = f"cache_{phone_clean}.sqlite" if phone_clean else "movistar_upload_cache.sqlite"
+
     custom = os.getenv("MOVISTAR_CACHE_PATH")
     if custom:
         return Path(custom).expanduser()
@@ -327,36 +330,24 @@ def get_cache_db_path(target_path: Path | None = None) -> Path:
     try:
         tokens_dir.mkdir(parents=True, exist_ok=True)
         if os.access(tokens_dir, os.W_OK):
-            target_db = tokens_dir / "movistar_upload_cache.sqlite"
-            # Si existía una caché previa en /data, migrarla si no existe en tokens
-            old_data_cache = Path("/data/.movistar_upload_cache.sqlite")
-            if old_data_cache.exists() and not target_db.exists():
-                try:
-                    import shutil
-                    shutil.copy2(old_data_cache, target_db)
-                    logging.getLogger("MovistarGallery").info(
-                        f"Migrada base de datos de caché existente de {old_data_cache} a {target_db}"
-                    )
-                except Exception:
-                    pass
+            target_db = tokens_dir / db_name
             return target_db
     except Exception:
         pass
 
-    # 2. Directorio Home del usuario (C:\Users\... o /root en Linux)
-    home_db = Path.home() / ".movistar_upload_cache.sqlite"
+    # 2. Directorio home del usuario
+    home_db = Path.home() / db_name
     try:
-        if os.access(Path.home(), os.W_OK):
+        home_db.parent.mkdir(parents=True, exist_ok=True)
+        if os.access(home_db.parent, os.W_OK):
             return home_db
     except Exception:
         pass
 
-    # 3. /tmp local
-    tmp_dir = Path("/tmp")
-    if tmp_dir.exists() and os.access(tmp_dir, os.W_OK):
-        return tmp_dir / "movistar_upload_cache.sqlite"
-
-    return home_db
+    # 3. Fallback a target_path
+    if target_path and target_path.is_dir() and os.access(target_path, os.W_OK):
+        return target_path / f".{db_name}"
+    return Path.cwd() / db_name
 
 # ---------------------------------------------------------
 # CONSTANTS & CONFIGURATION
@@ -760,14 +751,28 @@ def main() -> int:
     parser.add_argument("--debug", action="store_true", help="Mostrar logs HTTP y debug")
     parser.add_argument("--workers", type=int, default=3, help="Número de subidas simultáneas (por defecto: 3)")
     parser.add_argument("--takeout", action="store_true", help="Modo Google Takeout: omite miniaturas (<40KB) y lee el .json para las fechas")
+    parser.add_argument("--phone", type=str, default=None, help="Número de teléfono móvil asociado a la cuenta")
     args = parser.parse_args()
 
     # Configuración de Logging
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
-    # Intentar cargar .env desde volumen de tokens, carpeta local o actual
-    env_paths = [Path("/app/tokens/.env"), Path(__file__).parent / ".env", Path.cwd() / ".env", Path.home() / ".env"]
+    phone_clean = "".join(filter(str.isdigit, str(args.phone or os.getenv("MOVISTAR_PHONE") or "")))
+    if phone_clean:
+        logger.info(f"Cuenta de usuario activa: {phone_clean}")
+        env_paths = [
+            Path(f"/app/tokens/account_{phone_clean}.env"),
+            Path(f"/app/tokens/{phone_clean}.env"),
+            Path(f"/app/.env_{phone_clean}"),
+            Path("/app/tokens/.env"),
+            Path(__file__).parent / ".env",
+            Path.cwd() / ".env",
+            Path.home() / ".env"
+        ]
+    else:
+        env_paths = [Path("/app/tokens/.env"), Path(__file__).parent / ".env", Path.cwd() / ".env", Path.home() / ".env"]
+
     for ep in env_paths:
         if ep.exists():
             logger.debug(f"Cargando variables de entorno desde {ep}")
@@ -799,8 +804,9 @@ def main() -> int:
         mc.login()
         mc.start_keepalive(interval_seconds=300)
         
-        # 2. Inicializar base de datos de caché persistente (en volumen seguro)
-        cache_path = get_cache_db_path(path)
+        # 2. Inicializar base de datos de caché persistente (en volumen seguro, aislada por teléfono)
+        cache_path = get_cache_db_path(path, phone=phone_clean)
+        logger.info(f"Base de datos de caché local: {cache_path.name}")
         cache = UploadCache(cache_path)
         global _GLOBAL_CACHE
         _GLOBAL_CACHE = cache
