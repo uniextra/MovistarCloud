@@ -115,26 +115,22 @@ def sanitize_phone(phone: str) -> str:
 
 def save_env(jsessionid, validationkey, phone=None):
     phone_clean = sanitize_phone(phone)
+    if not phone_clean:
+        print("Error: No se proporcionó número de teléfono para guardar credenciales.", flush=True)
+        return
+
     content = f"""# Movistar Cloud Session
 MOVISTAR_JSESSIONID="{jsessionid}"
 MOVISTAR_VALIDATIONKEY="{validationkey}"
+MOVISTAR_PHONE="{phone_clean}"
 """
-    if phone_clean:
-        content += f'MOVISTAR_PHONE="{phone_clean}"\n'
-
-    targets = []
-    if phone_clean:
-        targets.append(Path(f"/app/tokens/account_{phone_clean}.env"))
-    else:
-        targets.extend([Path("/app/tokens/.env"), Path("/app/.env"), Path(".env")])
-
-    for t in targets:
-        try:
-            t.parent.mkdir(parents=True, exist_ok=True)
-            t.write_text(content, encoding='utf-8')
-            print(f"Archivo .env generado correctamente en: {t}", flush=True)
-        except Exception:
-            pass
+    target = Path(f"/app/tokens/account_{phone_clean}.env")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding='utf-8')
+        print(f"Archivo de credenciales guardado correctamente en: {target}", flush=True)
+    except Exception as e:
+        print(f"Error al guardar credenciales: {e}", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

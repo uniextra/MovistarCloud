@@ -59,43 +59,19 @@ def get_env_paths(phone=None):
             paths.append(acct_file)
         return paths
 
-    if TOKENS_DIR.exists() or os.access("/app", os.W_OK):
-        try:
-            TOKENS_DIR.mkdir(parents=True, exist_ok=True)
-            paths.append(PRIMARY_ENV_PATH)
-        except Exception:
-            pass
-    paths.append(FALLBACK_ENV_PATH)
-    paths.append(Path(".env"))
-    return paths
+    return []
 
 def get_env_vars(phone=None):
     phone_clean = sanitize_phone(phone)
+    if not phone_clean:
+        return {}
+
     parsed_vars = {}
-
-    if phone_clean:
-        # Modo estricto por teléfono: buscar únicamente en los archivos de este número
-        candidates = [
-            TOKENS_DIR / f"account_{phone_clean}.env",
-            TOKENS_DIR / f"{phone_clean}.env"
-        ]
-        for p in candidates:
-            try:
-                if p.exists() and p.is_file():
-                    with open(p, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith('#') and '=' in line:
-                                k, v = line.split('=', 1)
-                                parsed_vars[k.strip()] = v.strip().strip('"').strip("'")
-                    if parsed_vars.get("MOVISTAR_JSESSIONID") or parsed_vars.get("MOVISTAR_VALIDATIONKEY"):
-                        return parsed_vars
-            except Exception:
-                pass
-        return parsed_vars
-
-    # Si no se indica teléfono: fallback a archivos globales
-    for p in [PRIMARY_ENV_PATH, FALLBACK_ENV_PATH, Path(".env")]:
+    candidates = [
+        TOKENS_DIR / f"account_{phone_clean}.env",
+        TOKENS_DIR / f"{phone_clean}.env"
+    ]
+    for p in candidates:
         try:
             if p.exists() and p.is_file():
                 with open(p, 'r', encoding='utf-8') as f:
@@ -112,20 +88,17 @@ def get_env_vars(phone=None):
 
 def save_env_vars(jsid, vkey, phone=None):
     phone_clean = sanitize_phone(phone)
-    content = f'MOVISTAR_JSESSIONID="{jsid}"\nMOVISTAR_VALIDATIONKEY="{vkey}"\n'
-    if phone_clean:
-        content += f'MOVISTAR_PHONE="{phone_clean}"\n'
-        targets = [TOKENS_DIR / f"account_{phone_clean}.env"]
-    else:
-        targets = [PRIMARY_ENV_PATH, FALLBACK_ENV_PATH]
+    if not phone_clean:
+        return
 
-    for p in targets:
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with open(p, 'w', encoding='utf-8') as f:
-                f.write(content)
-        except Exception:
-            pass
+    content = f'MOVISTAR_JSESSIONID="{jsid}"\nMOVISTAR_VALIDATIONKEY="{vkey}"\nMOVISTAR_PHONE="{phone_clean}"\n'
+    target = TOKENS_DIR / f"account_{phone_clean}.env"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, 'w', encoding='utf-8') as f:
+            f.write(content)
+    except Exception:
+        pass
 
 def keepalive_worker():
     """Hilo demonio que realiza ping periódico a Movistar Cloud para evitar que JSESSIONID caduque por inactividad."""
@@ -134,7 +107,7 @@ def keepalive_worker():
         time.sleep(300)  # Cada 5 minutos
         try:
             # Buscar todos los archivos de cuentas disponibles
-            env_files = [PRIMARY_ENV_PATH, FALLBACK_ENV_PATH]
+            env_files = []
             if TOKENS_DIR.exists():
                 env_files.extend(list(TOKENS_DIR.glob("account_*.env")))
                 env_files.extend(list(TOKENS_DIR.glob("*.env")))
@@ -163,22 +136,6 @@ def keepalive_worker():
                             app.logger.debug(f"Keep-Alive heartbeat OK para {env_path.name}")
                 except Exception:
                     pass
-        except Exception as e:
-            app.logger.debug(f"Keep-Alive ping error: {e}")
-            env = get_env_vars()
-            jsid = env.get("MOVISTAR_JSESSIONID")
-            vk = env.get("MOVISTAR_VALIDATIONKEY")
-            if jsid and vk:
-                s = requests.Session()
-                s.cookies.set("JSESSIONID", jsid, domain="micloud.movistar.es", path="/")
-                s.cookies.set("validationkey", vk, domain="micloud.movistar.es", path="/")
-                s.headers.update({"User-Agent": "MovistarCloud-KeepAlive/1.0"})
-                url = f"https://micloud.movistar.es/sapi/system/information?action=get&validationkey={vk}"
-                r = s.get(url, timeout=15)
-                if r.status_code == 200:
-                    app.logger.debug("Keep-Alive heartbeat OK (sesión renovada).")
-                elif r.status_code == 401:
-                    app.logger.warning("Keep-Alive detectó sesión expirada (401).")
         except Exception as e:
             app.logger.debug(f"Keep-Alive ping error: {e}")
 
@@ -433,6 +390,8 @@ def start_login():
     global LOGIN_PROCESS, LOGIN_PHONE
     data = request.json or {}
     phone = sanitize_phone(data.get("phone", ""))
+    if not phone:
+        return jsonify({"status": "error", "message": "Debes especificar un número móvil para el login"}), 400
     LOGIN_PHONE = phone
 
     ensure_vnc_services()
@@ -441,10 +400,7 @@ def start_login():
         kill_process_tree(LOGIN_PROCESS)
         LOGIN_PROCESS = None
             
-    cmd = ["python", "-u", "/app/movistar_login.py"]
-    if phone:
-        cmd.extend(["--phone", phone])
-
+    cmd = ["python", "-u", "/app/movistar_login.py", "--phone", phone]
     LOGIN_PROCESS = subprocess.Popen(cmd, start_new_session=True)
     return jsonify({"status": "ok"})
 
