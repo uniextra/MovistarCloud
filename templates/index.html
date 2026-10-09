@@ -176,7 +176,7 @@
                             <label for="jsessionid" class="text-xs font-semibold text-slate-700 tracking-wide">MOVISTAR_JSESSIONID</label>
                             <span class="text-[11px] text-slate-400 font-mono" data-i18n="sessionCookieLabel">Cookie de sesión</span>
                         </div>
-                        <input type="text" id="jsessionid" value="{{ jsessionid }}" data-i18n-ph="jsessionidPlaceholder" placeholder="Ej: E370FC8F2B597354DCE9CD92F31422F6.2i148" class="w-full text-xs font-mono px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:border-movistar-500 focus:ring-2 focus:ring-movistar-500/20 outline-none transition text-slate-900">
+                        <input type="text" id="jsessionid" value="" data-i18n-ph="jsessionidPlaceholder" placeholder="Ej: E370FC8F2B597354DCE9CD92F31422F6.2i148" class="w-full text-xs font-mono px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:border-movistar-500 focus:ring-2 focus:ring-movistar-500/20 outline-none transition text-slate-900">
                     </div>
 
                     <div>
@@ -184,7 +184,7 @@
                             <label for="validationkey" class="text-xs font-semibold text-slate-700 tracking-wide">MOVISTAR_VALIDATIONKEY</label>
                             <span class="text-[11px] text-slate-400 font-mono" data-i18n="validationKeyLabel">Token API Galería</span>
                         </div>
-                        <input type="text" id="validationkey" value="{{ validationkey }}" data-i18n-ph="validationkeyPlaceholder" placeholder="Ej: 30467c2b2a3f405b5146323621295962" class="w-full text-xs font-mono px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:border-movistar-500 focus:ring-2 focus:ring-movistar-500/20 outline-none transition text-slate-900">
+                        <input type="text" id="validationkey" value="" data-i18n-ph="validationkeyPlaceholder" placeholder="Ej: 30467c2b2a3f405b5146323621295962" class="w-full text-xs font-mono px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:border-movistar-500 focus:ring-2 focus:ring-movistar-500/20 outline-none transition text-slate-900">
                     </div>
                 </div>
             </div>
@@ -476,6 +476,13 @@ Esperando inicio del proceso de subida...
                 anotherRunningNotice: "Notice: An upload is currently running for another account on the server."
             }
         };
+
+        // Limpieza de claves globales heredadas en almacenamiento local
+        try {
+            localStorage.removeItem('movistar_jsid');
+            localStorage.removeItem('movistar_validationkey');
+            localStorage.removeItem('movistar_vkey');
+        } catch (e) {}
 
         // Detect browser / system language: Spanish -> 'es', Any other language -> 'en'
         function detectLanguage() {

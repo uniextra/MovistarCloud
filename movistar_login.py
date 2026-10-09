@@ -124,12 +124,9 @@ MOVISTAR_VALIDATIONKEY="{validationkey}"
 
     targets = []
     if phone_clean:
-        targets.extend([
-            Path(f"/app/tokens/account_{phone_clean}.env"),
-            Path(f"/app/tokens/{phone_clean}.env"),
-            Path(f"/app/.env_{phone_clean}"),
-        ])
-    targets.extend([Path("/app/tokens/.env"), Path("/app/.env"), Path(".env")])
+        targets.append(Path(f"/app/tokens/account_{phone_clean}.env"))
+    else:
+        targets.extend([Path("/app/tokens/.env"), Path("/app/.env"), Path(".env")])
 
     for t in targets:
         try:

@@ -33,28 +33,69 @@ def sanitize_phone(phone):
         digits = digits[2:]
     return digits
 
+def get_account_env_path(phone):
+    phone_clean = sanitize_phone(phone)
+    if not phone_clean:
+        return None
+    acct_file = TOKENS_DIR / f"account_{phone_clean}.env"
+    if acct_file.exists():
+        return acct_file
+    legacy_file = TOKENS_DIR / f"{phone_clean}.env"
+    if legacy_file.exists():
+        return legacy_file
+    return acct_file
+
 def get_env_paths(phone=None):
     paths = []
     phone_clean = sanitize_phone(phone)
+    if phone_clean:
+        acct_file = TOKENS_DIR / f"account_{phone_clean}.env"
+        legacy_file = TOKENS_DIR / f"{phone_clean}.env"
+        if acct_file.exists():
+            paths.append(acct_file)
+        if legacy_file.exists():
+            paths.append(legacy_file)
+        if not paths:
+            paths.append(acct_file)
+        return paths
+
     if TOKENS_DIR.exists() or os.access("/app", os.W_OK):
         try:
             TOKENS_DIR.mkdir(parents=True, exist_ok=True)
-            if phone_clean:
-                paths.append(TOKENS_DIR / f"account_{phone_clean}.env")
-                paths.append(TOKENS_DIR / f"{phone_clean}.env")
             paths.append(PRIMARY_ENV_PATH)
         except Exception:
             pass
-    if phone_clean:
-        paths.append(Path(f"/app/.env_{phone_clean}"))
     paths.append(FALLBACK_ENV_PATH)
     paths.append(Path(".env"))
     return paths
 
 def get_env_vars(phone=None):
-    env_vars = os.environ.copy()
     phone_clean = sanitize_phone(phone)
-    for p in get_env_paths(phone_clean):
+    parsed_vars = {}
+
+    if phone_clean:
+        # Modo estricto por teléfono: buscar únicamente en los archivos de este número
+        candidates = [
+            TOKENS_DIR / f"account_{phone_clean}.env",
+            TOKENS_DIR / f"{phone_clean}.env"
+        ]
+        for p in candidates:
+            try:
+                if p.exists() and p.is_file():
+                    with open(p, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith('#') and '=' in line:
+                                k, v = line.split('=', 1)
+                                parsed_vars[k.strip()] = v.strip().strip('"').strip("'")
+                    if parsed_vars.get("MOVISTAR_JSESSIONID") or parsed_vars.get("MOVISTAR_VALIDATIONKEY"):
+                        return parsed_vars
+            except Exception:
+                pass
+        return parsed_vars
+
+    # Si no se indica teléfono: fallback a archivos globales
+    for p in [PRIMARY_ENV_PATH, FALLBACK_ENV_PATH, Path(".env")]:
         try:
             if p.exists() and p.is_file():
                 with open(p, 'r', encoding='utf-8') as f:
@@ -62,28 +103,21 @@ def get_env_vars(phone=None):
                         line = line.strip()
                         if line and not line.startswith('#') and '=' in line:
                             k, v = line.split('=', 1)
-                            env_vars[k.strip()] = v.strip().strip('"').strip("'")
-                # Si estamos buscando un teléfono específico, nos detenemos al encontrar su archivo
-                if phone_clean and (f"account_{phone_clean}.env" in p.name or f"{phone_clean}.env" in p.name or f".env_{phone_clean}" in p.name):
-                    break
-                elif not phone_clean:
-                    break
+                            parsed_vars[k.strip()] = v.strip().strip('"').strip("'")
+                if parsed_vars.get("MOVISTAR_JSESSIONID") or parsed_vars.get("MOVISTAR_VALIDATIONKEY"):
+                    return parsed_vars
         except Exception:
             pass
-    return env_vars
+    return parsed_vars
 
 def save_env_vars(jsid, vkey, phone=None):
     phone_clean = sanitize_phone(phone)
     content = f'MOVISTAR_JSESSIONID="{jsid}"\nMOVISTAR_VALIDATIONKEY="{vkey}"\n'
     if phone_clean:
         content += f'MOVISTAR_PHONE="{phone_clean}"\n'
-
-    targets = []
-    if phone_clean:
-        targets.append(TOKENS_DIR / f"account_{phone_clean}.env")
-        targets.append(TOKENS_DIR / f"{phone_clean}.env")
-    targets.append(PRIMARY_ENV_PATH)
-    targets.append(FALLBACK_ENV_PATH)
+        targets = [TOKENS_DIR / f"account_{phone_clean}.env"]
+    else:
+        targets = [PRIMARY_ENV_PATH, FALLBACK_ENV_PATH]
 
     for p in targets:
         try:
@@ -281,7 +315,11 @@ def start():
             return jsonify({"status": "error", "message": "Faltan las credenciales de sesión"}), 400
 
         save_env_vars(jsid, vkey, phone=phone)
-        env_vars = get_env_vars(phone)
+        proc_env = os.environ.copy()
+        proc_env.update(get_env_vars(phone))
+        proc_env["MOVISTAR_JSESSIONID"] = jsid
+        proc_env["MOVISTAR_VALIDATIONKEY"] = vkey
+        proc_env["MOVISTAR_PHONE"] = phone
 
         cmd = [
             "python", "-u", "/app/movistar_cloud_gallery.py", 
@@ -305,7 +343,7 @@ def start():
                 stderr=subprocess.STDOUT, 
                 text=True,
                 bufsize=1,
-                env=env_vars,
+                env=proc_env,
                 start_new_session=True
             )
             UPLOAD_PROCESS = proc

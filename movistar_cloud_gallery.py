@@ -764,11 +764,7 @@ def main() -> int:
         env_paths = [
             Path(f"/app/tokens/account_{phone_clean}.env"),
             Path(f"/app/tokens/{phone_clean}.env"),
-            Path(f"/app/.env_{phone_clean}"),
-            Path("/app/tokens/.env"),
-            Path(__file__).parent / ".env",
-            Path.cwd() / ".env",
-            Path.home() / ".env"
+            Path(f"/app/.env_{phone_clean}")
         ]
     else:
         env_paths = [Path("/app/tokens/.env"), Path(__file__).parent / ".env", Path.cwd() / ".env", Path.home() / ".env"]
