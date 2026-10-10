@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -396,16 +397,72 @@ def mime_for(path: Path) -> str:
         return known[ext]
     return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
+def get_takeout_json_candidates(path: Path) -> list[Path]:
+    parent = path.parent
+    name = path.name
+    stem = path.stem
+    suffix = path.suffix
+    
+    candidates = []
+    
+    # 1. Standard patterns & Supplemental Metadata
+    candidates.append(parent / f"{name}.json")
+    candidates.append(parent / f"{stem}.json")
+    candidates.append(parent / f"{name}.supplemental-metadata.json")
+    candidates.append(parent / f"{stem}.supplemental-metadata.json")
+    
+    # 2. Numbered duplicates with bracket swap: e.g. "IMG_1234(1).jpg" -> "IMG_1234.jpg(1).json"
+    bracket_match = re.search(r"\(\d+\)$", stem)
+    if bracket_match:
+        idx = bracket_match.group(0) # e.g. "(1)"
+        base_stem = stem[:bracket_match.start()]
+        candidates.append(parent / f"{base_stem}{suffix}{idx}.json")
+        candidates.append(parent / f"{base_stem}{idx}{suffix}.json")
+        candidates.append(parent / f"{base_stem}{suffix}.supplemental-metadata{idx}.json")
+        candidates.append(parent / f"{base_stem}.supplemental-metadata{idx}.json")
+
+    # 3. Truncated filenames (Takeout 46/47/51 character limits)
+    for length in (46, 47, 51):
+        if len(name) >= length:
+            candidates.append(parent / f"{name[:length]}.json")
+        if len(stem) >= length:
+            candidates.append(parent / f"{stem[:length]}.json")
+            
+    # Also handle partial extension cuts (.j, .jp, .jpe, etc.)
+    for cut_len in range(1, len(suffix)):
+        candidates.append(parent / f"{stem}{suffix[:cut_len]}.json")
+
+    # 4. Edited images without their own JSON
+    edited_match = re.search(r"(-[a-zA-ZÀ-ÖØ-öø-ÿ]+)(\(\d+\))?$", stem)
+    if edited_match:
+        clean_stem = stem[:edited_match.start()]
+        number_suffix = edited_match.group(2) or ""
+        candidates.append(parent / f"{clean_stem}{suffix}{number_suffix}.json")
+        candidates.append(parent / f"{clean_stem}{number_suffix}.json")
+        candidates.append(parent / f"{clean_stem}{suffix}.supplemental-metadata{number_suffix}.json")
+
+    # 5. Live / Motion Photo cross-extension (MP4/MOV paired with HEIC/JPG)
+    if suffix.lower() in {".mp4", ".mov"}:
+        for photo_ext in (".heic", ".HEIC", ".jpg", ".JPG", ".jpeg", ".JPEG"):
+            candidates.append(parent / f"{stem}{photo_ext}.json")
+            candidates.append(parent / f"{stem}{photo_ext}.supplemental-metadata.json")
+
+    # Return unique candidates preserving order
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique_candidates.append(c)
+            
+    return unique_candidates
+
 def capture_time(path: Path, is_takeout: bool = False) -> datetime:
     """Attempts to extract original capture date from JSON (if Takeout) or EXIF, otherwise falls back to mtime."""
     
-    # Modo Takeout: Buscar primero el metadata JSON original (Ej: foto.jpg.json o foto.json)
+    # Modo Takeout: Buscar primero el metadata JSON original usando lógicas avanzadas
     if is_takeout:
-        json_paths = [
-            path.parent / (path.name + ".json"),
-            path.parent / (path.stem + ".json"),
-            path.parent / (path.stem + path.suffix[:2] + ".json") # Sometimes takeout cuts extensions
-        ]
+        json_paths = get_takeout_json_candidates(path)
         
         for jp in json_paths:
             if jp.exists():
