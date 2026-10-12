@@ -46,6 +46,18 @@ try:
 except Exception:
     pass
 
+def calculate_file_md5(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """
+    Calcula el checksum MD5 rápido del fichero por bloques de 1MB.
+    Alineado con el motor oficial de Movistar (Funambol::FileSystem::getFileChecksum / calculateChecksumForTwins)
+    para deduplicación ultra-rápida y detección de archivos gemelos o renombrados.
+    """
+    md5 = hashlib.md5()
+    with path.open("rb") as f:
+        while chunk := f.read(chunk_size):
+            md5.update(chunk)
+    return md5.hexdigest()
+
 class UploadCache:
     """
     Base de datos SQLite persistente para garantizar que ninguna foto o vídeo
@@ -73,11 +85,19 @@ class UploadCache:
                     cloud_id INTEGER,
                     uploaded_at TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    checksum TEXT,
                     UNIQUE(file_path, file_size)
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_checksum ON uploaded_files(checksum)")
+            
+            # Migración automática si la tabla existía previamente sin la columna checksum
+            try:
+                conn.execute("ALTER TABLE uploaded_files ADD COLUMN checksum TEXT")
+            except Exception:
+                pass
 
     def _open_connection(self, path: Path, timeout: float = 30.0) -> sqlite3.Connection:
         if str(path) != ":memory:":
@@ -200,7 +220,7 @@ class UploadCache:
                 logging.getLogger("MovistarGallery").error(f"Error inicializando respaldo {fallback}: {fb_err}")
                 self.db_path = Path(":memory:")
 
-    def is_uploaded(self, path: Path) -> bool:
+    def is_uploaded(self, path: Path, check_checksum: bool = True) -> bool:
         with self._lock:
             try:
                 stat = path.stat()
@@ -211,20 +231,29 @@ class UploadCache:
                 for attempt in range(3):
                     try:
                         conn = self._get_conn()
-                        # 1. Chequeo por ruta completa y tamaño
+                        # 1. Chequeo ultra-rápido O(1) por ruta completa y tamaño
                         cur = conn.execute(
                             "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok' LIMIT 1",
                             (rel_path, size)
                         )
                         if cur.fetchone():
                             return True
-                        # 2. Chequeo por nombre de archivo y tamaño
+                        # 2. Chequeo O(1) por nombre de archivo y tamaño
                         cur = conn.execute(
                             "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok' LIMIT 1",
                             (name, size)
                         )
                         if cur.fetchone():
                             return True
+                        # 3. Detección de gemelos / archivos renombrados por checksum MD5 (Funambol calculateChecksumForTwins)
+                        if check_checksum:
+                            file_md5 = calculate_file_md5(path)
+                            cur = conn.execute(
+                                "SELECT id FROM uploaded_files WHERE checksum = ? AND status = 'ok' LIMIT 1",
+                                (file_md5,)
+                            )
+                            if cur.fetchone():
+                                return True
                         return False
                     except sqlite3.OperationalError as e:
                         err_msg = str(e).lower()
@@ -239,7 +268,7 @@ class UploadCache:
                 logging.getLogger("MovistarGallery").debug(f"Error consultando caché para {path.name}: {e}")
             return False
 
-    def mark_uploaded(self, path: Path, cloud_id: int | None = None, status: str = "ok"):
+    def mark_uploaded(self, path: Path, cloud_id: int | None = None, status: str = "ok", checksum: str | None = None):
         with self._lock:
             try:
                 stat = path.stat()
@@ -248,19 +277,21 @@ class UploadCache:
                 mtime = stat.st_mtime
                 rel_path = str(path)
                 now = datetime.now(timezone.utc).isoformat()
+                file_md5 = checksum or calculate_file_md5(path)
                 
                 for attempt in range(3):
                     try:
                         conn = self._get_conn()
                         with conn:
                             conn.execute("""
-                                INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status, checksum)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                 ON CONFLICT(file_path, file_size) DO UPDATE SET
                                     cloud_id = excluded.cloud_id,
                                     uploaded_at = excluded.uploaded_at,
-                                    status = excluded.status
-                            """, (rel_path, name, size, mtime, cloud_id, now, status))
+                                    status = excluded.status,
+                                    checksum = excluded.checksum
+                            """, (rel_path, name, size, mtime, cloud_id, now, status, file_md5))
                         return
                     except sqlite3.OperationalError as e:
                         err_msg = str(e).lower()
@@ -474,6 +505,13 @@ def capture_time(path: Path, is_takeout: bool = False) -> datetime:
                             return datetime.fromtimestamp(ts, tz=timezone.utc)
                 except Exception:
                     pass
+
+    # Regla oficial para vídeos (Funambol::MHMediaRequestManager::patchCreationDateForVideos):
+    # 'Replacing video's creation_date with its modification_date before upload for item'
+    # En el cliente oficial, los vídeos reemplazan 'creation_date' con 'modification_date' porque
+    # los contenedores MP4/MOV a menudo carecen de timestamp fiable o tienen épocas erróneas (00:00 UTC).
+    if path.suffix.lower() in VIDEO_EXTENSIONS:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
 
     # Fallback normal a EXIF
     if Image is not None and path.suffix.lower() in PHOTO_EXTENSIONS:
@@ -735,6 +773,7 @@ class MovistarCloud:
         stat = path.stat()
         dt = capture_time(path, is_takeout=is_takeout)
         mime = mime_for(path)
+        file_md5 = calculate_file_md5(path)
 
         meta = {
             "data": {
@@ -766,6 +805,7 @@ class MovistarCloud:
             "etag": result.get("etag", ""),
             "mime": mime,
             "date": dt.isoformat(),
+            "checksum": file_md5,
         }
 
     def validation_status(self, file_id: int) -> str:
@@ -928,8 +968,9 @@ def main() -> int:
             try:
                 result = mc.upload_to_gallery(p, is_takeout=args.takeout)
                 file_id = result.get('id')
+                file_md5 = result.get('checksum')
                 logger.info(f"{progress_prefix} [OK] {p.name} subido exitosamente (ID: {file_id}).")
-                cache.mark_uploaded(p, cloud_id=file_id, status="ok")
+                cache.mark_uploaded(p, cloud_id=file_id, status="ok", checksum=file_md5)
 
                 if not args.no_wait and file_id:
                     mc.wait_usable(file_id)
