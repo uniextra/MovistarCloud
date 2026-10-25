@@ -106,11 +106,8 @@ def keepalive_worker():
     while True:
         time.sleep(300)  # Cada 5 minutos
         try:
-            # Buscar todos los archivos de cuentas disponibles
-            env_files = []
-            if TOKENS_DIR.exists():
-                env_files.extend(list(TOKENS_DIR.glob("account_*.env")))
-                env_files.extend(list(TOKENS_DIR.glob("*.env")))
+            # Buscar todos los archivos de cuentas dedicadas sin duplicados
+            env_files = list(set(TOKENS_DIR.glob("account_*.env"))) if TOKENS_DIR.exists() else []
 
             checked_keys = set()
             for env_path in env_files:
@@ -134,8 +131,12 @@ def keepalive_worker():
                         r = s.get(url, timeout=15)
                         if r.status_code == 200:
                             app.logger.debug(f"Keep-Alive heartbeat OK para {env_path.name}")
-                except Exception:
-                    pass
+                        elif r.status_code == 401:
+                            app.logger.warning(f"Keep-Alive: Sesión caducada (401 Unauthorized) para {env_path.name}")
+                        else:
+                            app.logger.debug(f"Keep-Alive respuesta HTTP {r.status_code} para {env_path.name}")
+                except Exception as ex:
+                    app.logger.debug(f"Keep-Alive error en {env_path.name}: {ex}")
         except Exception as e:
             app.logger.debug(f"Keep-Alive ping error: {e}")
 

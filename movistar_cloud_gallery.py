@@ -91,13 +91,16 @@ class UploadCache:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_name_size ON uploaded_files(file_name, file_size)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON uploaded_files(file_path)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_checksum ON uploaded_files(checksum)")
             
-            # Migración automática si la tabla existía previamente sin la columna checksum
+            # Migración automática segura si la tabla existía previamente sin la columna checksum
             try:
-                conn.execute("ALTER TABLE uploaded_files ADD COLUMN checksum TEXT")
+                cols = [row[1] for row in conn.execute("PRAGMA table_info(uploaded_files)").fetchall()]
+                if "checksum" not in cols:
+                    conn.execute("ALTER TABLE uploaded_files ADD COLUMN checksum TEXT")
             except Exception:
                 pass
+                
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_checksum ON uploaded_files(checksum)")
 
     def _open_connection(self, path: Path, timeout: float = 30.0) -> sqlite3.Connection:
         if str(path) != ":memory:":
@@ -221,52 +224,70 @@ class UploadCache:
                 self.db_path = Path(":memory:")
 
     def is_uploaded(self, path: Path, check_checksum: bool = True) -> bool:
+        try:
+            stat = path.stat()
+            size = stat.st_size
+            name = path.name
+            rel_path = str(path)
+        except Exception:
+            return False
+
+        # 1. Chequeo ultra-rápido O(1) bajo lock (por ruta y por nombre, sin lecturas de disco pesadas)
         with self._lock:
+            for attempt in range(3):
+                try:
+                    conn = self._get_conn()
+                    cur = conn.execute(
+                        "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok' LIMIT 1",
+                        (rel_path, size)
+                    )
+                    if cur.fetchone():
+                        return True
+                    cur = conn.execute(
+                        "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok' LIMIT 1",
+                        (name, size)
+                    )
+                    if cur.fetchone():
+                        return True
+                    break
+                except sqlite3.OperationalError as e:
+                    err_msg = str(e).lower()
+                    if "no such table" in err_msg:
+                        self._create_tables(conn)
+                        continue
+                    if "locked" in err_msg or "busy" in err_msg:
+                        time.sleep(0.05 * (attempt + 1))
+                        continue
+                    raise
+
+        # 2. Detección de gemelos / archivos renombrados por checksum MD5 (estilo Funambol)
+        if check_checksum:
+            # CRÍTICO: Calcular el MD5 FUERA del mutex lock para evitar congelar el resto de hilos de subida
             try:
-                stat = path.stat()
-                size = stat.st_size
-                name = path.name
-                rel_path = str(path)
-                
+                file_md5 = calculate_file_md5(path)
+            except Exception as e:
+                logging.getLogger("MovistarGallery").debug(f"Error calculando MD5 para {path.name}: {e}")
+                return False
+
+            with self._lock:
                 for attempt in range(3):
                     try:
                         conn = self._get_conn()
-                        # 1. Chequeo ultra-rápido O(1) por ruta completa y tamaño
                         cur = conn.execute(
-                            "SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok' LIMIT 1",
-                            (rel_path, size)
+                            "SELECT id FROM uploaded_files WHERE checksum = ? AND status = 'ok' LIMIT 1",
+                            (file_md5,)
                         )
                         if cur.fetchone():
                             return True
-                        # 2. Chequeo O(1) por nombre de archivo y tamaño
-                        cur = conn.execute(
-                            "SELECT id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND status = 'ok' LIMIT 1",
-                            (name, size)
-                        )
-                        if cur.fetchone():
-                            return True
-                        # 3. Detección de gemelos / archivos renombrados por checksum MD5 (Funambol calculateChecksumForTwins)
-                        if check_checksum:
-                            file_md5 = calculate_file_md5(path)
-                            cur = conn.execute(
-                                "SELECT id FROM uploaded_files WHERE checksum = ? AND status = 'ok' LIMIT 1",
-                                (file_md5,)
-                            )
-                            if cur.fetchone():
-                                return True
-                        return False
+                        break
                     except sqlite3.OperationalError as e:
                         err_msg = str(e).lower()
-                        if "no such table" in err_msg:
-                            self._create_tables(conn)
-                            continue
                         if "locked" in err_msg or "busy" in err_msg:
-                            time.sleep(0.1 * (attempt + 1))
+                            time.sleep(0.05 * (attempt + 1))
                             continue
                         raise
-            except Exception as e:
-                logging.getLogger("MovistarGallery").debug(f"Error consultando caché para {path.name}: {e}")
-            return False
+
+        return False
 
     def mark_uploaded(self, path: Path, cloud_id: int | None = None, status: str = "ok", checksum: str | None = None):
         with self._lock:
@@ -277,7 +298,6 @@ class UploadCache:
                 mtime = stat.st_mtime
                 rel_path = str(path)
                 now = datetime.now(timezone.utc).isoformat()
-                file_md5 = checksum or calculate_file_md5(path)
                 
                 for attempt in range(3):
                     try:
@@ -290,8 +310,8 @@ class UploadCache:
                                     cloud_id = excluded.cloud_id,
                                     uploaded_at = excluded.uploaded_at,
                                     status = excluded.status,
-                                    checksum = excluded.checksum
-                            """, (rel_path, name, size, mtime, cloud_id, now, status, file_md5))
+                                    checksum = COALESCE(excluded.checksum, uploaded_files.checksum)
+                            """, (rel_path, name, size, mtime, cloud_id, now, status, checksum))
                         return
                     except sqlite3.OperationalError as e:
                         err_msg = str(e).lower()
@@ -436,54 +456,75 @@ def get_takeout_json_candidates(path: Path) -> list[Path]:
     
     candidates = []
     
-    # 1. Standard patterns & Supplemental Metadata
-    candidates.append(parent / f"{name}.json")
+    # Manejar variaciones de sufijo en sistemas de archivos case-sensitive (Linux ext4)
+    # Ejemplo: Si la foto es DSC001.JPG, Takeout a menudo genera DSC001.jpg.json
+    suffixes_to_try = [suffix]
+    if suffix.lower() != suffix:
+        suffixes_to_try.append(suffix.lower())
+    if suffix.upper() != suffix:
+        suffixes_to_try.append(suffix.upper())
+
+    # 1. Patrones estándar y metadatos complementarios (con '.' y con '-')
+    for sfx in suffixes_to_try:
+        candidates.append(parent / f"{stem}{sfx}.json")
+        candidates.append(parent / f"{stem}{sfx}.supplemental-metadata.json")
+        candidates.append(parent / f"{stem}{sfx}-supplemental-metadata.json")
     candidates.append(parent / f"{stem}.json")
-    candidates.append(parent / f"{name}.supplemental-metadata.json")
     candidates.append(parent / f"{stem}.supplemental-metadata.json")
+    candidates.append(parent / f"{stem}-supplemental-metadata.json")
     
-    # 2. Numbered duplicates with bracket swap: e.g. "IMG_1234(1).jpg" -> "IMG_1234.jpg(1).json"
+    # 2. Duplicados numerados con intercambio de paréntesis: ej. "IMG_1234(1).jpg" -> "IMG_1234.jpg(1).json"
     bracket_match = re.search(r"\(\d+\)$", stem)
     if bracket_match:
         idx = bracket_match.group(0) # e.g. "(1)"
         base_stem = stem[:bracket_match.start()]
-        candidates.append(parent / f"{base_stem}{suffix}{idx}.json")
-        candidates.append(parent / f"{base_stem}{idx}{suffix}.json")
-        candidates.append(parent / f"{base_stem}{suffix}.supplemental-metadata{idx}.json")
+        for sfx in suffixes_to_try:
+            candidates.append(parent / f"{base_stem}{sfx}{idx}.json")
+            candidates.append(parent / f"{base_stem}{idx}{sfx}.json")
+            candidates.append(parent / f"{base_stem}{sfx}.supplemental-metadata{idx}.json")
+            candidates.append(parent / f"{base_stem}{sfx}-supplemental-metadata{idx}.json")
         candidates.append(parent / f"{base_stem}.supplemental-metadata{idx}.json")
+        candidates.append(parent / f"{base_stem}-supplemental-metadata{idx}.json")
 
-    # 3. Truncated filenames (Takeout 46/47/51 character limits)
+    # 3. Nombres truncados (Takeout 46/47/51 character limits)
     for length in (46, 47, 51):
         if len(name) >= length:
             candidates.append(parent / f"{name[:length]}.json")
         if len(stem) >= length:
             candidates.append(parent / f"{stem[:length]}.json")
             
-    # Also handle partial extension cuts (.j, .jp, .jpe, etc.)
-    for cut_len in range(1, len(suffix)):
-        candidates.append(parent / f"{stem}{suffix[:cut_len]}.json")
+    # Recortes parciales de extensión (.j, .jp, .jpe, etc.)
+    for sfx in suffixes_to_try:
+        for cut_len in range(1, len(sfx)):
+            candidates.append(parent / f"{stem}{sfx[:cut_len]}.json")
 
-    # 4. Edited images without their own JSON
+    # 4. Fotos editadas sin su propio JSON (ej. IMG_001-edited.jpg)
     edited_match = re.search(r"(-[a-zA-ZÀ-ÖØ-öø-ÿ]+)(\(\d+\))?$", stem)
-    if edited_match:
+    if edited_match and edited_match.start() > 0:
         clean_stem = stem[:edited_match.start()]
         number_suffix = edited_match.group(2) or ""
-        candidates.append(parent / f"{clean_stem}{suffix}{number_suffix}.json")
+        for sfx in suffixes_to_try:
+            candidates.append(parent / f"{clean_stem}{sfx}{number_suffix}.json")
+            candidates.append(parent / f"{clean_stem}{sfx}.supplemental-metadata{number_suffix}.json")
+            candidates.append(parent / f"{clean_stem}{sfx}-supplemental-metadata{number_suffix}.json")
         candidates.append(parent / f"{clean_stem}{number_suffix}.json")
-        candidates.append(parent / f"{clean_stem}{suffix}.supplemental-metadata{number_suffix}.json")
+        candidates.append(parent / f"{clean_stem}.supplemental-metadata{number_suffix}.json")
+        candidates.append(parent / f"{clean_stem}-supplemental-metadata{number_suffix}.json")
 
     # 5. Live / Motion Photo cross-extension (MP4/MOV paired with HEIC/JPG)
     if suffix.lower() in {".mp4", ".mov"}:
         for photo_ext in (".heic", ".HEIC", ".jpg", ".JPG", ".jpeg", ".JPEG"):
             candidates.append(parent / f"{stem}{photo_ext}.json")
             candidates.append(parent / f"{stem}{photo_ext}.supplemental-metadata.json")
+            candidates.append(parent / f"{stem}{photo_ext}-supplemental-metadata.json")
 
-    # Return unique candidates preserving order
+    # Devolver candidatos únicos preservando el orden de forma case-sensitive
     seen = set()
     unique_candidates = []
     for c in candidates:
-        if c not in seen:
-            seen.add(c)
+        key = str(c)
+        if key not in seen:
+            seen.add(key)
             unique_candidates.append(c)
             
     return unique_candidates
@@ -773,7 +814,6 @@ class MovistarCloud:
         stat = path.stat()
         dt = capture_time(path, is_takeout=is_takeout)
         mime = mime_for(path)
-        file_md5 = calculate_file_md5(path)
 
         meta = {
             "data": {
@@ -805,7 +845,7 @@ class MovistarCloud:
             "etag": result.get("etag", ""),
             "mime": mime,
             "date": dt.isoformat(),
-            "checksum": file_md5,
+            
         }
 
     def validation_status(self, file_id: int) -> str:
