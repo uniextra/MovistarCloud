@@ -62,6 +62,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/logs", s.handleLogs)
 	mux.HandleFunc("/start_login", s.handleStartLogin)
 	mux.HandleFunc("/complete_login", s.handleCompleteLogin)
+	mux.HandleFunc("/unlink", s.handleUnlink)
 
 	return mux
 }
@@ -133,6 +134,16 @@ func (s *Server) handleStorageInfo(w http.ResponseWriter, r *http.Request) {
 		if cfg.RefreshToken != "" || (cfg.JSessionID != "" && cfg.ValidationKey != "") {
 			s.client.SetConfig(cfg)
 		}
+	}
+
+	if !s.client.HasCredentials() {
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"status":    "unconfigured",
+			"message":   "Dispositivo no vinculado",
+			"used_str":  "-",
+			"total_str": "-",
+		})
+		return
 	}
 
 	space, err := s.client.GetStorageSpace()
@@ -322,11 +333,24 @@ func (s *Server) handleCompleteLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	devID := auth.GenerateDeviceID()
+	existingCfg := config.LoadAccountConfig(phone)
+	devID := existingCfg.DeviceID
+	if devID == "" {
+		devID = auth.GenerateDeviceID()
+	}
 	logger.Log("[OAuth] ✔ Tokens obtenidos. Inicializando sesión SAPI para dispositivo %s...", devID)
 
 	nowMS := time.Now().UnixMilli()
 	sapiRes := auth.SAPILoginOAuth(nil, tokens.AccessToken, tokens.RefreshToken, devID, "PC Windows", nowMS, strconv.Itoa(tokens.ExpiresIn))
+
+	if sapiRes.StatusCode != http.StatusOK && (sapiRes.ValidationKey == "" && sapiRes.JSessionID == "") {
+		logger.Log("[OAuth] ❌ Error inicializando sesión SAPI (HTTP %d): %v", sapiRes.StatusCode, sapiRes.Error)
+		jsonResponse(w, http.StatusBadRequest, map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("Error iniciando sesión en Movistar Cloud (HTTP %d). Comprueba que la línea tenga el servicio activo.", sapiRes.StatusCode),
+		})
+		return
+	}
 
 	cfg := config.AccountConfig{
 		Phone:           phone,
@@ -367,5 +391,28 @@ func (s *Server) handleCompleteLogin(w http.ResponseWriter, r *http.Request) {
 	s.client.SetConfig(cfg)
 
 	logger.Log("[OAuth] ✔ ¡Dispositivo vinculado y guardado con éxito para %s!", phone)
+	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok"})
+}
+
+func (s *Server) handleUnlink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonResponse(w, http.StatusMethodNotAllowed, map[string]interface{}{"status": "error", "message": "Método no permitido"})
+		return
+	}
+
+	var body struct {
+		Phone string `json:"phone"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	phone := config.SanitizePhone(body.Phone)
+	if phone == "" {
+		phone = s.client.GetConfig().Phone
+	}
+
+	_ = config.DeleteAccountConfig(phone)
+	s.client.SetConfig(config.AccountConfig{})
+	s.jobManager.StopJob()
+
+	logger.Log("[OAuth] 🗑️ Dispositivo desvinculado y credenciales eliminadas por el usuario.")
 	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok"})
 }

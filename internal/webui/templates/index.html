@@ -39,12 +39,15 @@
                     <button onclick="promptChangePhone()" class="ml-1 text-slate-400 hover:text-white transition" title="Cambiar cuenta">
                         ✏️
                     </button>
+                    <button onclick="unlinkAccount()" class="ml-1 text-slate-400 hover:text-rose-400 transition" title="Desvincular cuenta y borrar credenciales">
+                        🗑️
+                    </button>
                 </div>
 
                 <!-- Storage Pill -->
                 <div id="storage-pill" class="px-3 py-1.5 bg-indigo-950/60 border border-indigo-800/40 text-indigo-300 rounded-xl text-xs font-medium flex items-center space-x-1.5">
                     <span>💾</span>
-                    <span id="storage-text">Consultando cuota...</span>
+                    <span id="storage-text">- / -</span>
                 </div>
             </div>
         </header>
@@ -215,7 +218,7 @@
     <!-- 2. Official 3-Step OAuth Modal -->
     <div id="oauthModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
         <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-6 shadow-2xl relative">
-            <button onclick="closeOAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">✕</button>
+            <button onclick="closeOAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg leading-none">&times;</button>
 
             <div class="flex items-center space-x-3 mb-4">
                 <div class="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center text-lg">
@@ -232,12 +235,15 @@
                 <div class="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80">
                     <div class="font-bold text-slate-200 mb-1 flex items-center">
                         <span class="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[11px] mr-2">1</span>
-                        Generar Autorización Oficial
+                        Generar Enlace Oficial de Telefónica
                     </div>
-                    <p class="text-slate-400 mb-3 ml-7">Inicia el desafío PKCE para el número: <span class="font-mono text-blue-400" id="oauth-target-phone">-</span></p>
-                    <div class="ml-7">
-                        <button onclick="generateOAuthLink()" id="oauth-gen-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg font-medium transition">
+                    <p class="text-slate-400 mb-3 ml-7">Inicia el desafío PKCE para el número: <span class="font-mono text-blue-400 font-semibold" id="oauth-target-phone">-</span></p>
+                    <div class="ml-7 flex flex-wrap gap-2">
+                        <button onclick="generateOAuthLink()" id="oauth-gen-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg font-medium transition shadow-sm">
                             Generar Enlace Seguro de Telefónica
+                        </button>
+                        <button onclick="copyOAuthUrl()" id="oauth-copy-btn" class="hidden px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium rounded-lg transition flex items-center space-x-1">
+                            <span>📋 Copiar Enlace</span>
                         </button>
                     </div>
                 </div>
@@ -248,10 +254,10 @@
                         <span class="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[11px] mr-2">2</span>
                         Iniciar Sesión en Movistar
                     </div>
-                    <p class="text-slate-400 mb-3 ml-7">Abre la página oficial de Telefónica, introduce tu clave o código SMS y confirma el acceso:</p>
+                    <p class="text-slate-400 mb-3 ml-7">Abre la página oficial de Telefónica en tu navegador, introduce tu número y el código SMS:</p>
                     <div class="ml-7">
                         <a id="oauth-link-btn" href="#" target="_blank" class="pointer-events-none inline-flex items-center space-x-1.5 bg-slate-800 text-slate-400 px-4 py-2 rounded-lg font-medium transition">
-                            <span>Abrir Login Oficial Telefónica</span>
+                            <span>🌐 Abrir Login de Movistar</span>
                             <span>↗</span>
                         </a>
                     </div>
@@ -261,14 +267,14 @@
                 <div id="step-3-box" class="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80 opacity-50">
                     <div class="font-bold text-slate-200 mb-1 flex items-center">
                         <span class="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[11px] mr-2">3</span>
-                        Pegar URL o Código de Retorno
+                        Pegar URL final o Código de Retorno
                     </div>
                     <p class="text-slate-400 mb-2 ml-7">Al identificarte con éxito, la ventana mostrará una dirección que contiene <code>code=...</code>. Cópiala y pégala aquí:</p>
                     <div class="ml-7 space-y-2">
-                        <input type="text" id="oauth-code-input" disabled placeholder="Pega aquí la URL completa o el código devuelto" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white outline-none focus:border-emerald-500">
-                        <div id="oauth-finish-error" class="text-rose-400 hidden"></div>
-                        <button onclick="completeOAuthLogin()" id="oauth-finish-btn" disabled class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-medium transition disabled:opacity-40">
-                            Completar Vinculación Permanente
+                        <textarea id="oauth-code-input" rows="2" disabled placeholder="Ej: https://micloud.movistar.es/ui/html/clientoauth.html?code=740b4648-... o 740b4648-..." class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"></textarea>
+                        <div id="oauth-finish-error" class="text-rose-400 hidden font-medium"></div>
+                        <button onclick="completeOAuthLogin()" id="oauth-finish-btn" disabled class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-semibold transition disabled:opacity-40 shadow-sm">
+                            ✔ Validar y Guardar Credenciales
                         </button>
                     </div>
                 </div>
@@ -284,7 +290,7 @@
                     <span class="text-lg">📁</span>
                     <h3 class="text-base font-bold text-white">Explorador de Carpetas</h3>
                 </div>
-                <button onclick="closeFolderBrowser()" class="text-slate-400 hover:text-white">✕</button>
+                <button onclick="closeFolderBrowser()" class="text-slate-400 hover:text-white leading-none">&times;</button>
             </div>
 
             <!-- Path Bar -->
@@ -309,9 +315,13 @@
         </div>
     </div>
 
+    <!-- Toast Notifications Container -->
+    <div id="toastContainer" class="fixed top-5 right-5 z-[9999] flex flex-col space-y-3 pointer-events-none max-w-sm w-full"></div>
+
     <script>
         let currentPhone = localStorage.getItem("movistar_phone") || "";
         let browserPath = "/data";
+        let currentAuthURL = "";
 
         window.addEventListener("DOMContentLoaded", () => {
             if (currentPhone) {
@@ -321,6 +331,51 @@
             }
             startPolling();
         });
+
+        // Toast Notification System
+        function showToast(message, type = 'success', duration = 4000) {
+            const container = document.getElementById('toastContainer');
+            if (!container) return;
+
+            const toast = document.createElement('div');
+            toast.className = 'pointer-events-auto transform transition-all duration-300 ease-out translate-x-12 opacity-0 flex items-center p-4 rounded-xl shadow-xl border text-sm font-medium';
+
+            let icon = '';
+            if (type === 'success') {
+                toast.className += ' bg-emerald-600 text-white border-emerald-500 shadow-emerald-900/25';
+                icon = '<svg class="w-5 h-5 mr-3 flex-shrink-0 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>';
+            } else if (type === 'error') {
+                toast.className += ' bg-rose-600 text-white border-rose-500 shadow-rose-900/25';
+                icon = '<svg class="w-5 h-5 mr-3 flex-shrink-0 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"></path></svg>';
+            } else if (type === 'warning') {
+                toast.className += ' bg-amber-500 text-white border-amber-400 shadow-amber-900/25';
+                icon = '<svg class="w-5 h-5 mr-3 flex-shrink-0 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>';
+            } else {
+                toast.className += ' bg-slate-800 text-white border-slate-700 shadow-slate-900/25';
+                icon = '<svg class="w-5 h-5 mr-3 flex-shrink-0 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
+            }
+
+            toast.innerHTML = `
+                ${icon}
+                <div class="flex-1 mr-2 leading-tight">${message}</div>
+                <button class="opacity-70 hover:opacity-100 text-white transition ml-2 focus:outline-none" onclick="this.parentElement.remove()">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            `;
+
+            container.appendChild(toast);
+
+            requestAnimationFrame(() => {
+                toast.classList.remove('translate-x-12', 'opacity-0');
+                toast.classList.add('translate-x-0', 'opacity-100');
+            });
+
+            setTimeout(() => {
+                toast.classList.remove('translate-x-0', 'opacity-100');
+                toast.classList.add('translate-x-12', 'opacity-0');
+                setTimeout(() => toast.remove(), 300);
+            }, duration);
+        }
 
         function showGateModal() {
             document.getElementById("phoneGateModal").classList.remove("hidden");
@@ -360,8 +415,10 @@
 
                     if (!data.has_credentials) {
                         openOAuthModal();
+                        showToast("Cuenta no vinculada. Por favor, completa la vinculación oficial.", "warning");
                     } else {
                         loadStorageInfo();
+                        showToast(`Sesión activa para ${currentPhone}`, "success");
                     }
                 } else {
                     errDiv.textContent = data.message || "Error al verificar teléfono";
@@ -389,6 +446,7 @@
                     document.getElementById("current-phone-text").textContent = currentPhone;
                     hideGateModal();
                     if (!data.has_credentials) {
+                        document.getElementById("storage-text").textContent = "- / -";
                         openOAuthModal();
                     } else {
                         loadStorageInfo();
@@ -402,13 +460,18 @@
         }
 
         async function loadStorageInfo() {
+            if (!currentPhone) return;
             try {
                 const res = await fetch("/storage_info?phone=" + encodeURIComponent(currentPhone));
                 const data = await res.json();
                 if (data.status === "ok") {
                     document.getElementById("storage-text").textContent = `${data.used_str} / ${data.total_str}`;
+                } else {
+                    document.getElementById("storage-text").textContent = "- / -";
                 }
-            } catch (e) {}
+            } catch (e) {
+                document.getElementById("storage-text").textContent = "- / -";
+            }
         }
 
         // OAuth Modal Functions
@@ -439,21 +502,60 @@
                 const data = await res.json();
 
                 if (data.status === "ok" && data.auth_url) {
+                    currentAuthURL = data.auth_url;
                     const linkBtn = document.getElementById("oauth-link-btn");
                     linkBtn.href = data.auth_url;
                     linkBtn.classList.remove("pointer-events-none", "bg-slate-800", "text-slate-400");
                     linkBtn.classList.add("bg-blue-600", "hover:bg-blue-500", "text-white");
-                    document.getElementById("step-2-box").classList.remove("opacity-50");
 
+                    document.getElementById("oauth-copy-btn").classList.remove("hidden");
+                    document.getElementById("step-2-box").classList.remove("opacity-50");
                     document.getElementById("step-3-box").classList.remove("opacity-50");
                     document.getElementById("oauth-code-input").disabled = false;
                     document.getElementById("oauth-finish-btn").disabled = false;
+
+                    showToast("Enlace de autorización oficial generado.", "info", 3000);
+                } else {
+                    showToast("Error generando enlace de login: " + (data.message || 'Desconocido'), "error");
                 }
             } catch (e) {
-                alert("Error generando enlace de login");
+                showToast("Error de conexión al generar enlace", "error");
             } finally {
                 btn.disabled = false;
                 btn.textContent = "Regenerar Enlace";
+            }
+        }
+
+        function copyOAuthUrl() {
+            if (!currentAuthURL) return;
+
+            const fallbackCopy = (content) => {
+                const textArea = document.createElement("textarea");
+                textArea.value = content;
+                textArea.style.position = "fixed";
+                textArea.style.left = "-9999px";
+                textArea.style.top = "-9999px";
+                textArea.setAttribute("readonly", "");
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    const successful = document.execCommand('copy');
+                    if (successful) {
+                        showToast("Enlace copiado al portapapeles.", "success", 3000);
+                    }
+                } catch (err) {
+                    console.error("Fallback execCommand copy error:", err);
+                }
+                document.body.removeChild(textArea);
+            };
+
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(currentAuthURL)
+                    .then(() => showToast("Enlace copiado al portapapeles.", "success", 3000))
+                    .catch(() => fallbackCopy(currentAuthURL));
+            } else {
+                fallbackCopy(currentAuthURL);
             }
         }
 
@@ -462,11 +564,14 @@
             const errDiv = document.getElementById("oauth-finish-error");
             const btn = document.getElementById("oauth-finish-btn");
 
-            if (!codeInput) return;
+            if (!codeInput) {
+                showToast("Pega la dirección URL o el código recibido.", "warning");
+                return;
+            }
 
             errDiv.classList.add("hidden");
             btn.disabled = true;
-            btn.textContent = "Vinculando...";
+            btn.textContent = "Vinculando dispositivo...";
 
             try {
                 const res = await fetch("/complete_login", {
@@ -479,17 +584,47 @@
                 if (data.status === "ok") {
                     closeOAuthModal();
                     loadStorageInfo();
-                    alert("¡Dispositivo vinculado con éxito!");
+                    showToast("¡Dispositivo vinculado con éxito a Movistar Cloud!", "success", 5000);
                 } else {
                     errDiv.textContent = data.message || "Error al completar vinculación";
                     errDiv.classList.remove("hidden");
+                    showToast("Error canjeando código: " + (data.message || 'Código inválido'), "error", 6000);
                 }
             } catch (e) {
-                errDiv.textContent = "Error de comunicación";
+                errDiv.textContent = "Error de comunicación con el servidor";
                 errDiv.classList.remove("hidden");
+                showToast("Error de conexión al validar código", "error");
             } finally {
                 btn.disabled = false;
-                btn.textContent = "Completar Vinculación Permanente";
+                btn.textContent = "✔ Validar y Guardar Credenciales";
+            }
+        }
+
+        async function unlinkAccount() {
+            if (!currentPhone) return;
+            if (!confirm(`¿Deseas desvincular el dispositivo y eliminar las credenciales guardadas para ${currentPhone}?`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch('/unlink', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ phone: currentPhone })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    localStorage.removeItem('movistar_phone');
+                    currentPhone = "";
+                    document.getElementById("current-phone-text").textContent = "Sin cuenta";
+                    document.getElementById("storage-text").textContent = "- / -";
+                    showToast("Dispositivo desvinculado y credenciales eliminadas.", "info", 4000);
+                    showGateModal();
+                } else {
+                    showToast("Error al desvincular: " + (data.message || 'Error desconocido'), "error");
+                }
+            } catch (err) {
+                showToast("Error de conexión al desvincular.", "error");
             }
         }
 
@@ -573,16 +708,19 @@
                 });
                 const data = await res.json();
                 if (data.status !== "ok") {
-                    alert(data.message || "Error al iniciar subida");
+                    showToast(data.message || "Error al iniciar subida", "error");
+                } else {
+                    showToast("Proceso de subida iniciado.", "success");
                 }
             } catch (e) {
-                alert("Error de conexión");
+                showToast("Error de conexión al iniciar subida", "error");
             }
         }
 
         async function stopUpload() {
             try {
                 await fetch("/stop", { method: "POST" });
+                showToast("Subida detenida.", "warning");
             } catch (e) {}
         }
 

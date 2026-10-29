@@ -94,6 +94,12 @@ func (c *Client) GetConfig() config.AccountConfig {
 	return c.cfg
 }
 
+func (c *Client) HasCredentials() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cfg.RefreshToken != "" || c.cfg.AccessToken != "" || (c.cfg.JSessionID != "" && c.cfg.ValidationKey != "")
+}
+
 func (c *Client) appendValidationKey(u string) string {
 	c.mu.RLock()
 	vk := c.cfg.ValidationKey
@@ -114,6 +120,10 @@ func (c *Client) appendValidationKey(u string) string {
 }
 
 func (c *Client) processSAPIResponse(resp *http.Response) {
+	if resp == nil || resp.StatusCode >= 400 {
+		return
+	}
+
 	c.mu.Lock()
 	changed := false
 
@@ -167,6 +177,10 @@ func (c *Client) RefreshSession() bool {
 	cfg := c.cfg
 	c.mu.RUnlock()
 
+	if cfg.AccessToken == "" && cfg.RefreshToken == "" {
+		return false
+	}
+
 	logger.Log("[OAuth] 🔄 Renovando sesión SAPI...")
 
 	// 1. Primary attempt: SAPILoginOAuth with current access_token
@@ -216,7 +230,11 @@ func (c *Client) RefreshSession() bool {
 			cfgCopy := c.cfg
 			c.mu.Unlock()
 
-			res := auth.SAPILoginOAuth(c.httpClient, tokens.AccessToken, cfgCopy.RefreshToken, cfgCopy.DeviceID, cfgCopy.DeviceName, c.cfg.LastRefreshDate, c.cfg.ExpiresIn)
+			// Persistir inmediatamente los nuevos tokens para proteger contra RTR (Refresh Token Rotation)
+			_ = config.SaveAccountConfig(cfgCopy)
+
+			// Con nuevo access_token, inicializar SAPI
+			res := auth.SAPILoginOAuth(c.httpClient, tokens.AccessToken, cfgCopy.RefreshToken, cfgCopy.DeviceID, cfgCopy.DeviceName, cfgCopy.LastRefreshDate, cfgCopy.ExpiresIn)
 			if res.StatusCode == http.StatusOK {
 				c.mu.Lock()
 				if res.ValidationKey != "" {
@@ -228,6 +246,14 @@ func (c *Client) RefreshSession() bool {
 				if res.LastRefreshDate > 0 {
 					c.cfg.LastRefreshDate = res.LastRefreshDate
 				}
+				if res.RefreshedOAuth != nil {
+					if res.RefreshedOAuth.AccessToken != "" {
+						c.cfg.AccessToken = res.RefreshedOAuth.AccessToken
+					}
+					if res.RefreshedOAuth.RefreshToken != "" {
+						c.cfg.RefreshToken = res.RefreshedOAuth.RefreshToken
+					}
+				}
 				cfgCopy2 := c.cfg
 				c.mu.Unlock()
 
@@ -236,6 +262,8 @@ func (c *Client) RefreshSession() bool {
 				}
 				logger.Log("[OAuth] ✔ Tokens renovados y sesión SAPI inicializada con éxito.")
 				return true
+			} else {
+				logger.Log("[OAuth] ⚠️ Inicialización SAPI devolvió HTTP %d tras refresco: %v", res.StatusCode, res.Error)
 			}
 		} else if err != nil {
 			logger.Log("[OAuth] ❌ Error canjeando refresh_token: %v", err)
@@ -281,7 +309,7 @@ func (c *Client) DoRequest(req *http.Request) (*http.Response, error) {
 		}
 		_ = resp.Body.Close()
 
-		if c.RefreshSession() {
+		if c.HasCredentials() && c.RefreshSession() {
 			c.mu.RLock()
 			newCfg := c.cfg
 			c.mu.RUnlock()
