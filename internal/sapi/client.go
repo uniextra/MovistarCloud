@@ -741,7 +741,6 @@ func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTi
 
 	return CloudUploadResult{}, errors.New("subida fallida tras agotar reintentos de validación MED-1017")
 }
-}
 
 func parseFlexibleInt(v interface{}) int64 {
 	switch val := v.(type) {
