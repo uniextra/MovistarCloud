@@ -44,13 +44,14 @@ type CloudUploadResult struct {
 }
 
 type Client struct {
-	cfg        config.AccountConfig
-	baseURL    string
-	uploadURL  string
-	httpClient *http.Client
-	cookieJar  *cookiejar.Jar
-	mu         sync.RWMutex
-	refreshMu  sync.Mutex
+	cfg              config.AccountConfig
+	baseURL          string
+	uploadURL        string
+	httpClient       *http.Client
+	cookieJar        *cookiejar.Jar
+	mu               sync.RWMutex
+	refreshMu        sync.Mutex
+	OnSessionExpired func(err error)
 }
 
 func NewClient(cfg config.AccountConfig) *Client {
@@ -73,10 +74,17 @@ func NewClient(cfg config.AccountConfig) *Client {
 		Timeout:   0, // No global timeout to allow huge file uploads
 	}
 
+	baseURL := "https://micloud.movistar.es"
+	uploadURL := "https://upload.micloud.movistar.es"
+	if strings.EqualFold(cfg.Provider, "o2") {
+		baseURL = "https://cloud.o2online.es"
+		uploadURL = "https://upload.cloud.o2online.es"
+	}
+
 	return &Client{
 		cfg:        cfg,
-		baseURL:    "https://micloud.movistar.es",
-		uploadURL:  "https://upload.micloud.movistar.es",
+		baseURL:    baseURL,
+		uploadURL:  uploadURL,
 		httpClient: httpClient,
 		cookieJar:  jar,
 	}
@@ -86,6 +94,13 @@ func (c *Client) SetConfig(cfg config.AccountConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cfg = cfg
+	if strings.EqualFold(cfg.Provider, "o2") {
+		c.baseURL = "https://cloud.o2online.es"
+		c.uploadURL = "https://upload.cloud.o2online.es"
+	} else {
+		c.baseURL = "https://micloud.movistar.es"
+		c.uploadURL = "https://upload.micloud.movistar.es"
+	}
 }
 
 func (c *Client) GetConfig() config.AccountConfig {
@@ -184,8 +199,9 @@ func (c *Client) RefreshSession() bool {
 	logger.Log("[OAuth] 🔄 Renovando sesión SAPI...")
 
 	// 1. Primary attempt: SAPILoginOAuth with current access_token
+	sapiBase := auth.GetSAPIBaseURL(cfg.Provider)
 	if cfg.AccessToken != "" {
-		res := auth.SAPILoginOAuth(c.httpClient, cfg.AccessToken, cfg.RefreshToken, cfg.DeviceID, cfg.DeviceName, cfg.LastRefreshDate, cfg.ExpiresIn)
+		res := auth.SAPILoginOAuth(c.httpClient, sapiBase, cfg.AccessToken, cfg.RefreshToken, cfg.DeviceID, cfg.DeviceName, cfg.LastRefreshDate, cfg.ExpiresIn)
 		if res.StatusCode == http.StatusOK && (res.ValidationKey != "" || res.JSessionID != "") {
 			c.mu.Lock()
 			if res.ValidationKey != "" {
@@ -234,7 +250,7 @@ func (c *Client) RefreshSession() bool {
 			_ = config.SaveAccountConfig(cfgCopy)
 
 			// Con nuevo access_token, inicializar SAPI
-			res := auth.SAPILoginOAuth(c.httpClient, tokens.AccessToken, cfgCopy.RefreshToken, cfgCopy.DeviceID, cfgCopy.DeviceName, cfgCopy.LastRefreshDate, cfgCopy.ExpiresIn)
+			res := auth.SAPILoginOAuth(c.httpClient, sapiBase, tokens.AccessToken, cfgCopy.RefreshToken, cfgCopy.DeviceID, cfgCopy.DeviceName, cfgCopy.LastRefreshDate, cfgCopy.ExpiresIn)
 			if res.StatusCode == http.StatusOK {
 				c.mu.Lock()
 				if res.ValidationKey != "" {
@@ -271,6 +287,9 @@ func (c *Client) RefreshSession() bool {
 	}
 
 	logger.Log("[!] ⚠️ ERROR 401: No se pudo renovar la sesión automáticamente. Requiere revinculación en el panel web.")
+	if c.OnSessionExpired != nil {
+		go c.OnSessionExpired(errors.New("sesión expirada (HTTP 401)"))
+	}
 	return false
 }
 
@@ -544,7 +563,9 @@ func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 
 // UploadToGallery uploads a media file straight into the Gallery timeline.
 // CRITICAL: We deliberately omit 'folderid' to inject directly into the user's Gallery (not a folder).
-func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTime time.Time, mimeType string) (CloudUploadResult, error) {
+// If existingMediaID is provided (> 0), it is sent in data.id to overwrite in-place without creating a duplicate (1).
+// Automatic retries are performed if Telefónica's asynchronous validation window returns MED-1017.
+func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTime time.Time, mimeType string, existingMediaID *int64) (CloudUploadResult, error) {
 	fi, err := os.Stat(filePath)
 	if err != nil {
 		return CloudUploadResult{}, err
@@ -553,116 +574,173 @@ func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTi
 	fileSize := fi.Size()
 	dateStr := captureTime.UTC().Format("20060102T150405Z")
 
+	metaData := map[string]interface{}{
+		"name":             fileName,
+		"size":             fileSize,
+		"creationdate":     dateStr,
+		"modificationdate": dateStr,
+		"contenttype":      mimeType,
+	}
+	if existingMediaID != nil && *existingMediaID > 0 {
+		metaData["id"] = *existingMediaID
+		logger.Log("[SAPI] 📝 Sobrescritura in-place para ID existente: %d (%s)", *existingMediaID, fileName)
+	}
+
 	meta := map[string]interface{}{
-		"data": map[string]interface{}{
-			"name":             fileName,
-			"size":             fileSize,
-			"creationdate":     dateStr,
-			"modificationdate": dateStr,
-			"contenttype":      mimeType,
-			// CRITICAL: Do NOT send 'folderid'
-		},
+		"data": metaData,
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
 		return CloudUploadResult{}, err
 	}
 
-	fileHandle, err := os.Open(filePath)
-	if err != nil {
-		return CloudUploadResult{}, err
-	}
+	const maxValidationRetries = 14
+	const retryDelay = 1500 * time.Millisecond
 
-	pr, pw := io.Pipe()
-	mpw := multipart.NewWriter(pw)
+	for attempt := 0; attempt <= maxValidationRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return CloudUploadResult{}, ctx.Err()
+		default:
+		}
 
-	go func() {
-		defer fileHandle.Close()
-		defer pw.Close()
-		defer mpw.Close()
-
-		// 1. Data form field (JSON metadata)
-		partData, err := mpw.CreateFormField("data")
+		fileHandle, err := os.Open(filePath)
 		if err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		if _, err := partData.Write(metaBytes); err != nil {
-			_ = pw.CloseWithError(err)
-			return
+			return CloudUploadResult{}, err
 		}
 
-		// 2. File form field (binary stream)
-		partFile, err := mpw.CreateFormFile("file", fileName)
+		pr, pw := io.Pipe()
+		mpw := multipart.NewWriter(pw)
+
+		go func() {
+			defer fileHandle.Close()
+			defer pw.Close()
+			defer mpw.Close()
+
+			partData, err := mpw.CreateFormField("data")
+			if err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+			if _, err := partData.Write(metaBytes); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+
+			partFile, err := mpw.CreateFormFile("file", fileName)
+			if err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+			buf := make([]byte, 1024*1024)
+			if _, err := io.CopyBuffer(partFile, fileHandle, buf); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+		}()
+
+		c.mu.RLock()
+		upURL := c.uploadURL
+		c.mu.RUnlock()
+
+		uploadEndpoint := fmt.Sprintf("%s/sapi/upload?action=save&acceptasynchronous=true", upURL)
+		req, err := http.NewRequestWithContext(ctx, "POST", uploadEndpoint, pr)
 		if err != nil {
-			_ = pw.CloseWithError(err)
-			return
+			_ = pr.Close()
+			return CloudUploadResult{}, err
 		}
-		buf := make([]byte, 1024*1024) // 1 MB buffer for high throughput streaming
-		if _, err := io.CopyBuffer(partFile, fileHandle, buf); err != nil {
-			_ = pw.CloseWithError(err)
-			return
+		req.Header.Set("Content-Type", mpw.FormDataContentType())
+
+		resp, err := c.DoRequest(req)
+		if err != nil {
+			return CloudUploadResult{}, err
 		}
-	}()
 
-	uploadEndpoint := fmt.Sprintf("%s/sapi/upload?action=save&acceptasynchronous=true", c.uploadURL)
-	req, err := http.NewRequestWithContext(ctx, "POST", uploadEndpoint, pr)
-	if err != nil {
-		_ = pr.Close()
-		return CloudUploadResult{}, err
-	}
-	req.Header.Set("Content-Type", mpw.FormDataContentType())
+		bodyBytes, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			return CloudUploadResult{}, err
+		}
 
-	resp, err := c.DoRequest(req)
-	if err != nil {
-		return CloudUploadResult{}, err
-	}
-	defer resp.Body.Close()
+		bodyStr := string(bodyBytes)
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return CloudUploadResult{}, fmt.Errorf("upload returned HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-	}
+		// MED-1017 check: Media is being validated asynchronously (typically 4-10 seconds)
+		if strings.Contains(bodyStr, "MED-1017") || strings.Contains(strings.ToLower(bodyStr), "media not validated") {
+			if attempt < maxValidationRetries {
+				logger.Log("[SAPI] ⏳ Servidor validando media asíncronamente (MED-1017). Reintentando en 1.5s (intento %d/%d)...", attempt+1, maxValidationRetries)
+				select {
+				case <-ctx.Done():
+					return CloudUploadResult{}, ctx.Err()
+				case <-time.After(retryDelay):
+					continue
+				}
+			}
+		}
 
-	var res struct {
-		ID     interface{} `json:"id"`
-		Status string      `json:"status"`
-		ETag   string      `json:"etag"`
-		Data   struct {
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
+			return CloudUploadResult{}, fmt.Errorf("upload returned HTTP %d: %s", resp.StatusCode, bodyStr)
+		}
+
+		var res struct {
 			ID     interface{} `json:"id"`
 			Status string      `json:"status"`
 			ETag   string      `json:"etag"`
-		} `json:"data"`
+			Error  *struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+			Data struct {
+				ID     interface{} `json:"id"`
+				Status string      `json:"status"`
+				ETag   string      `json:"etag"`
+			} `json:"data"`
+		}
+
+		if err := json.Unmarshal(bodyBytes, &res); err != nil {
+			return CloudUploadResult{}, err
+		}
+
+		if res.Error != nil && res.Error.Code != "" {
+			if res.Error.Code == "MED-1017" && attempt < maxValidationRetries {
+				logger.Log("[SAPI] ⏳ Servidor validando media asíncronamente (MED-1017 en error body). Reintentando en 1.5s (intento %d/%d)...", attempt+1, maxValidationRetries)
+				select {
+				case <-ctx.Done():
+					return CloudUploadResult{}, ctx.Err()
+				case <-time.After(retryDelay):
+					continue
+				}
+			}
+			return CloudUploadResult{}, fmt.Errorf("SAPI error %s: %s", res.Error.Code, res.Error.Message)
+		}
+
+		finalID := parseFlexibleInt(res.ID)
+		if finalID == 0 {
+			finalID = parseFlexibleInt(res.Data.ID)
+		}
+
+		status := res.Status
+		if status == "" {
+			status = res.Data.Status
+		}
+
+		etag := res.ETag
+		if etag == "" {
+			etag = res.Data.ETag
+		}
+
+		if finalID == 0 {
+			return CloudUploadResult{}, errors.New("upload response did not contain a valid media ID")
+		}
+
+		return CloudUploadResult{
+			ID:     finalID,
+			Status: status,
+			ETag:   etag,
+		}, nil
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return CloudUploadResult{}, err
-	}
-
-	finalID := parseFlexibleInt(res.ID)
-	if finalID == 0 {
-		finalID = parseFlexibleInt(res.Data.ID)
-	}
-
-	status := res.Status
-	if status == "" {
-		status = res.Data.Status
-	}
-
-	etag := res.ETag
-	if etag == "" {
-		etag = res.Data.ETag
-	}
-
-	if finalID == 0 {
-		return CloudUploadResult{}, errors.New("upload response did not contain a valid media ID")
-	}
-
-	return CloudUploadResult{
-		ID:     finalID,
-		Status: status,
-		ETag:   etag,
-	}, nil
+	return CloudUploadResult{}, errors.New("subida fallida tras agotar reintentos de validación MED-1017")
+}
 }
 
 func parseFlexibleInt(v interface{}) int64 {

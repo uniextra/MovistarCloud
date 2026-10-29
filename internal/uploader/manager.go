@@ -14,8 +14,25 @@ import (
 	"movistar-cloud-uploader/internal/config"
 	"movistar-cloud-uploader/internal/logger"
 	"movistar-cloud-uploader/internal/media"
+	"movistar-cloud-uploader/internal/notifier"
 	"movistar-cloud-uploader/internal/sapi"
 )
+
+var (
+	folderLocks sync.Map // path -> *sync.Mutex
+)
+
+// AcquireFolderLock serializes concurrent folder creation/modification per path
+// preventing Telefónica from creating duplicate "(1)" folders.
+func AcquireFolderLock(path string) func() {
+	cleaned := filepath.Clean(path)
+	val, _ := folderLocks.LoadOrStore(cleaned, &sync.Mutex{})
+	mu := val.(*sync.Mutex)
+	mu.Lock()
+	return func() {
+		mu.Unlock()
+	}
+}
 
 type JobStats struct {
 	State          string    `json:"state"`
@@ -36,6 +53,8 @@ type JobStats struct {
 
 type JobManager struct {
 	client     *sapi.Client
+	notifier   *notifier.TelegramNotifier
+	overlay    *cache.OverlayStore
 	mu         sync.RWMutex
 	cancelFunc context.CancelFunc
 
@@ -55,10 +74,31 @@ type JobManager struct {
 }
 
 func NewJobManager(client *sapi.Client) *JobManager {
-	return &JobManager{
-		client: client,
-		state:  "idle",
+	mgr := &JobManager{
+		client:   client,
+		notifier: notifier.NewTelegramNotifier("", ""),
+		overlay:  cache.NewOverlayStore(15 * time.Minute),
+		state:    "idle",
 	}
+
+	if client != nil {
+		client.OnSessionExpired = func(err error) {
+			if mgr.notifier != nil && mgr.notifier.IsConfigured() {
+				cfg := client.GetConfig()
+				_ = mgr.notifier.SendSessionExpiredAlert(cfg.Provider, cfg.Phone, err.Error())
+			}
+		}
+	}
+
+	return mgr
+}
+
+func (m *JobManager) GetNotifier() *notifier.TelegramNotifier {
+	return m.notifier
+}
+
+func (m *JobManager) GetOverlay() *cache.OverlayStore {
+	return m.overlay
 }
 
 func (m *JobManager) IsRunning() bool {
@@ -137,6 +177,9 @@ func (m *JobManager) StartJob(phone, folder string, recursive, takeout bool) err
 	}
 
 	m.client.SetConfig(accountCfg)
+	if accountCfg.TelegramBotToken != "" && accountCfg.TelegramChatID != "" {
+		m.notifier.UpdateCredentials(accountCfg.TelegramBotToken, accountCfg.TelegramChatID)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelFunc = cancel
@@ -166,7 +209,21 @@ func (m *JobManager) runPipeline(ctx context.Context, phone, folder string, recu
 			m.state = "completed"
 			logger.Log("[Job] ✔ Proceso de subida finalizado.")
 		}
+		durationSec := int64(time.Since(m.startTime).Seconds())
 		m.mu.Unlock()
+
+		if m.notifier != nil && m.notifier.IsConfigured() {
+			cfg := m.client.GetConfig()
+			_ = m.notifier.SendJobCompletedAlert(
+				cfg.Provider,
+				phone,
+				atomic.LoadInt64(&m.totalFiles),
+				atomic.LoadInt64(&m.uploadedCount),
+				atomic.LoadInt64(&m.skippedCount),
+				atomic.LoadInt64(&m.errorCount),
+				durationSec,
+			)
+		}
 	}()
 
 	logger.Log("[Job] ▶ Iniciando tarea para cuenta %s en carpeta: %s (recursivo=%v, takeout=%v)", phone, folder, recursive, takeout)
@@ -274,21 +331,42 @@ func (m *JobManager) processFile(ctx context.Context, filePath string, takeout b
 	total := atomic.LoadInt64(&m.totalFiles)
 	prefix := fmt.Sprintf("[%d/%d]", proc, total)
 
-	// 1. Persistent cache duplicate check
+	// 1. Overlay cache fast check (handles SAPI timeline propagation delay)
+	if fi, err := os.Stat(filePath); err == nil {
+		if isUp, isDel, _ := m.overlay.Check(filePath, fi.Size()); isUp && !isDel {
+			logger.Log("%s [SKIP] %s (Confirmado en caché Overlay reciente)", prefix, fileName)
+			atomic.AddInt64(&m.skippedCount, 1)
+			return
+		}
+	}
+
+	// 2. Persistent SQLite cache duplicate check
 	if c.IsUploaded(filePath, true) {
 		logger.Log("%s [SKIP] %s (Ya registrado en caché persistente)", prefix, fileName)
 		atomic.AddInt64(&m.skippedCount, 1)
 		return
 	}
 
-	// 2. Prepare upload metadata
+	// 3. Prepare upload metadata
 	capTime := media.CaptureTime(filePath, takeout)
 	mimeType := media.MimeFor(filePath)
 
-	logger.Log("%s [UPLOAD] Subiendo %s (%s, %s)...", prefix, fileName, mimeType, capTime.Format("2006-01-02 15:04:05"))
+	// In-place overwrite detection: check if this file exists remotely
+	existingID := c.GetCloudID(filePath)
+	if existingID == nil {
+		if _, _, oid := m.overlay.Check(filePath, 0); oid > 0 {
+			existingID = &oid
+		}
+	}
 
-	// 3. Upload directly to Gallery
-	res, err := m.client.UploadToGallery(ctx, filePath, capTime, mimeType)
+	if existingID != nil {
+		logger.Log("%s [UPLOAD-UPDATE] Sobrescribiendo %s en la nube (ID previo: %d)...", prefix, fileName, *existingID)
+	} else {
+		logger.Log("%s [UPLOAD] Subiendo %s (%s, %s)...", prefix, fileName, mimeType, capTime.Format("2006-01-02 15:04:05"))
+	}
+
+	// 4. Upload directly to Gallery (with MED-1017 retry and in-place ID)
+	res, err := m.client.UploadToGallery(ctx, filePath, capTime, mimeType, existingID)
 	if err != nil {
 		if err == context.Canceled {
 			return
@@ -298,10 +376,13 @@ func (m *JobManager) processFile(ctx context.Context, filePath string, takeout b
 		return
 	}
 
-	// 4. Record success in local SQLite cache
+	// 5. Record success in local SQLite cache & in-memory Overlay
 	var cloudID *int64
 	if res.ID > 0 {
 		cloudID = &res.ID
+		if fi, err := os.Stat(filePath); err == nil {
+			m.overlay.AddUploaded(filePath, fi.Size(), res.ID)
+		}
 	}
 	_ = c.MarkUploaded(filePath, cloudID, "ok", res.ETag)
 	atomic.AddInt64(&m.uploadedCount, 1)

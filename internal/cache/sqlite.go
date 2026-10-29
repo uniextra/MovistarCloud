@@ -174,6 +174,34 @@ func (c *UploadCache) IsUploaded(filePath string, checkChecksum bool) bool {
 	return false
 }
 
+func (c *UploadCache) GetCloudID(filePath string) *int64 {
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		return nil
+	}
+	size := fi.Size()
+	name := fi.Name()
+	relPath := filePath
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var cid sql.NullInt64
+	row := c.db.QueryRow("SELECT cloud_id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND cloud_id IS NOT NULL LIMIT 1", relPath, size)
+	if err := row.Scan(&cid); err == nil && cid.Valid && cid.Int64 > 0 {
+		val := cid.Int64
+		return &val
+	}
+
+	row = c.db.QueryRow("SELECT cloud_id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND cloud_id IS NOT NULL LIMIT 1", name, size)
+	if err := row.Scan(&cid); err == nil && cid.Valid && cid.Int64 > 0 {
+		val := cid.Int64
+		return &val
+	}
+
+	return nil
+}
+
 func (c *UploadCache) MarkUploaded(filePath string, cloudID *int64, status string, checksum string) error {
 	fi, err := os.Stat(filePath)
 	if err != nil {

@@ -24,14 +24,21 @@
                 </div>
                 <div>
                     <div class="flex items-center space-x-2">
-                        <h1 class="text-xl font-bold tracking-tight text-white">Movistar Cloud</h1>
-                        <span class="text-[10px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded-md border border-blue-500/30">v2.0 (Go Native)</span>
+                        <h1 id="app-title-header" class="text-xl font-bold tracking-tight text-white">Movistar Cloud</h1>
+                        <span id="provider-badge" class="text-[10px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded-md border border-blue-500/30">Movistar</span>
+                        <span class="text-[10px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-slate-800 text-slate-300 rounded-md border border-slate-700">v2.0 (Go Native)</span>
                     </div>
-                    <p class="text-xs text-slate-400">Sincronizador Directo a Galería & Timeline</p>
+                    <p class="text-xs text-slate-400">Sincronizador Directo a Galería & Timeline (Movistar & O2)</p>
                 </div>
             </div>
 
             <div class="flex flex-wrap items-center gap-2">
+                <!-- Telegram Pill -->
+                <button onclick="openTelegramModal()" id="telegram-header-btn" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs flex items-center space-x-1.5 transition text-slate-300" title="Configurar Notificaciones Telegram">
+                    <span>✈️</span>
+                    <span id="telegram-status-label">Telegram</span>
+                </button>
+
                 <!-- Phone Pill -->
                 <div id="phone-pill" class="flex items-center space-x-2 px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-xl text-xs">
                     <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -204,6 +211,17 @@
             
             <form onsubmit="handleGateSubmit(event)" class="space-y-4">
                 <div>
+                    <label class="block text-xs font-semibold text-slate-300 mb-1.5">Proveedor de Nube</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <button type="button" onclick="selectGateProvider('movistar')" id="gate-prov-movistar" class="py-2 px-3 rounded-xl border border-blue-500 bg-blue-600/20 text-blue-400 font-semibold text-xs flex items-center justify-center space-x-1.5 transition">
+                            <span>🔵</span><span>Movistar Cloud</span>
+                        </button>
+                        <button type="button" onclick="selectGateProvider('o2')" id="gate-prov-o2" class="py-2 px-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-xs flex items-center justify-center space-x-1.5 transition">
+                            <span>🟦</span><span>O2 Cloud</span>
+                        </button>
+                    </div>
+                </div>
+                <div>
                     <label class="block text-xs font-semibold text-slate-300 mb-1">Número de Teléfono</label>
                     <input type="tel" id="gate-phone-input" placeholder="Ej: 611223344" required class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-2.5 text-sm font-mono text-white outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
                 </div>
@@ -227,6 +245,14 @@
                 <div>
                     <h3 class="text-lg font-bold text-white">Vinculación Oficial de Dispositivo</h3>
                     <p class="text-xs text-slate-400">OAuth2 PKCE oficial de Telefónica (Sin navegadores emulados)</p>
+                </div>
+            </div>
+
+            <div class="mb-4 bg-slate-950/70 p-3 rounded-xl border border-slate-800/80 flex items-center justify-between text-xs">
+                <span class="text-slate-300 font-semibold">Proveedor para esta cuenta:</span>
+                <div class="flex space-x-2">
+                    <button type="button" onclick="setOAuthProvider('movistar')" id="oauth-prov-movistar" class="px-3 py-1 rounded-lg font-semibold border border-blue-500 bg-blue-600/20 text-blue-400 transition">Movistar</button>
+                    <button type="button" onclick="setOAuthProvider('o2')" id="oauth-prov-o2" class="px-3 py-1 rounded-lg font-semibold border border-slate-700 bg-slate-800 text-slate-400 transition">O2 Cloud</button>
                 </div>
             </div>
 
@@ -257,7 +283,7 @@
                     <p class="text-slate-400 mb-3 ml-7">Abre la página oficial de Telefónica en tu navegador, introduce tu número y el código SMS:</p>
                     <div class="ml-7">
                         <a id="oauth-link-btn" href="#" target="_blank" class="pointer-events-none inline-flex items-center space-x-1.5 bg-slate-800 text-slate-400 px-4 py-2 rounded-lg font-medium transition">
-                            <span>🌐 Abrir Login de Movistar</span>
+                            <span id="oauth-link-btn-text">🌐 Abrir Login de Movistar</span>
                             <span>↗</span>
                         </a>
                     </div>
@@ -315,13 +341,157 @@
         </div>
     </div>
 
+    <!-- 4. Telegram Notifications Modal -->
+    <div id="telegramModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl relative">
+            <button onclick="closeTelegramModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg leading-none">&times;</button>
+            <div class="flex items-center space-x-3 mb-4">
+                <div class="w-10 h-10 rounded-xl bg-sky-500/10 border border-sky-500/20 text-sky-400 flex items-center justify-center text-lg">
+                    ✈️
+                </div>
+                <div>
+                    <h3 class="text-base font-bold text-white">Notificaciones Telegram</h3>
+                    <p class="text-xs text-slate-400">Alertas al finalizar subida y expiración de sesión</p>
+                </div>
+            </div>
+
+            <div class="space-y-4 text-xs">
+                <div>
+                    <label class="block font-semibold text-slate-300 mb-1">Bot Token (@BotFather)</label>
+                    <input type="password" id="tg-token-input" placeholder="Ej: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 font-mono text-white outline-none focus:border-sky-500">
+                </div>
+                <div>
+                    <label class="block font-semibold text-slate-300 mb-1">Chat ID</label>
+                    <input type="text" id="tg-chat-input" placeholder="Ej: 123456789" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 font-mono text-white outline-none focus:border-sky-500">
+                </div>
+
+                <div class="flex space-x-2 pt-2">
+                    <button type="button" onclick="testTelegramAlert()" id="tg-test-btn" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 py-2.5 rounded-xl font-semibold transition border border-slate-700">
+                        🔔 Enviar Prueba
+                    </button>
+                    <button type="button" onclick="saveTelegramSettings()" id="tg-save-btn" class="flex-1 bg-sky-600 hover:bg-sky-500 text-white py-2.5 rounded-xl font-semibold transition shadow-sm">
+                        💾 Guardar
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Notifications Container -->
     <div id="toastContainer" class="fixed top-5 right-5 z-[9999] flex flex-col space-y-3 pointer-events-none max-w-sm w-full"></div>
 
     <script>
         let currentPhone = localStorage.getItem("movistar_phone") || "";
+        let currentProvider = localStorage.getItem("movistar_provider") || "movistar";
         let browserPath = "/data";
         let currentAuthURL = "";
+
+        function selectGateProvider(prov) {
+            currentProvider = prov;
+            const btnM = document.getElementById("gate-prov-movistar");
+            const btnO = document.getElementById("gate-prov-o2");
+            if (prov === "o2") {
+                btnO.className = "py-2 px-3 rounded-xl border border-sky-500 bg-sky-600/20 text-sky-400 font-semibold text-xs flex items-center justify-center space-x-1.5 transition";
+                btnM.className = "py-2 px-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-xs flex items-center justify-center space-x-1.5 transition";
+            } else {
+                btnM.className = "py-2 px-3 rounded-xl border border-blue-500 bg-blue-600/20 text-blue-400 font-semibold text-xs flex items-center justify-center space-x-1.5 transition";
+                btnO.className = "py-2 px-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-xs flex items-center justify-center space-x-1.5 transition";
+            }
+        }
+
+        function setOAuthProvider(prov) {
+            currentProvider = prov;
+            localStorage.setItem("movistar_provider", prov);
+            updateProviderUI();
+            const btnM = document.getElementById("oauth-prov-movistar");
+            const btnO = document.getElementById("oauth-prov-o2");
+            if (prov === "o2") {
+                btnO.className = "px-3 py-1 rounded-lg font-semibold border border-sky-500 bg-sky-600/20 text-sky-400 transition";
+                btnM.className = "px-3 py-1 rounded-lg font-semibold border border-slate-700 bg-slate-800 text-slate-400 transition";
+            } else {
+                btnM.className = "px-3 py-1 rounded-lg font-semibold border border-blue-500 bg-blue-600/20 text-blue-400 transition";
+                btnO.className = "px-3 py-1 rounded-lg font-semibold border border-slate-700 bg-slate-800 text-slate-400 transition";
+            }
+        }
+
+        function updateProviderUI() {
+            const badge = document.getElementById("provider-badge");
+            const title = document.getElementById("app-title-header");
+            const step2Label = document.getElementById("oauth-link-btn-text");
+            if (currentProvider === "o2") {
+                if (badge) { badge.textContent = "O2 Cloud"; badge.className = "text-[10px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-sky-500/20 text-sky-400 rounded-md border border-sky-500/30"; }
+                if (title) { title.textContent = "O2 Cloud"; }
+                if (step2Label) { step2Label.textContent = "🌐 Abrir Login de O2"; }
+            } else {
+                if (badge) { badge.textContent = "Movistar"; badge.className = "text-[10px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded-md border border-blue-500/30"; }
+                if (title) { title.textContent = "Movistar Cloud"; }
+                if (step2Label) { step2Label.textContent = "🌐 Abrir Login de Movistar"; }
+            }
+        }
+
+        function openTelegramModal() {
+            document.getElementById("telegramModal").classList.remove("hidden");
+        }
+
+        function closeTelegramModal() {
+            document.getElementById("telegramModal").classList.add("hidden");
+        }
+
+        async function testTelegramAlert() {
+            const token = document.getElementById("tg-token-input").value.trim();
+            const chat = document.getElementById("tg-chat-input").value.trim();
+            const btn = document.getElementById("tg-test-btn");
+            btn.disabled = true;
+            btn.textContent = "Enviando...";
+
+            try {
+                const res = await fetch("/test_telegram", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ phone: currentPhone, bot_token: token, chat_id: chat })
+                });
+                const data = await res.json();
+                if (data.status === "ok") {
+                    showToast("¡Mensaje de prueba de Telegram enviado con éxito!", "success");
+                } else {
+                    showToast(data.message || "Error al contactar con Telegram", "error");
+                }
+            } catch (e) {
+                showToast("Error de red contactando servidor", "error");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "🔔 Enviar Prueba";
+            }
+        }
+
+        async function saveTelegramSettings() {
+            const token = document.getElementById("tg-token-input").value.trim();
+            const chat = document.getElementById("tg-chat-input").value.trim();
+            const btn = document.getElementById("tg-save-btn");
+            btn.disabled = true;
+            btn.textContent = "Guardando...";
+
+            try {
+                const res = await fetch("/save_telegram", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ phone: currentPhone, bot_token: token, chat_id: chat })
+                });
+                const data = await res.json();
+                if (data.status === "ok") {
+                    showToast("Ajustes de Telegram guardados.", "success");
+                    document.getElementById("telegram-status-label").textContent = token && chat ? "Telegram (Activo)" : "Telegram";
+                    closeTelegramModal();
+                } else {
+                    showToast(data.message || "Error al guardar ajustes", "error");
+                }
+            } catch (e) {
+                showToast("Error de red guardando ajustes", "error");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "💾 Guardar";
+            }
+        }
 
         window.addEventListener("DOMContentLoaded", () => {
             if (currentPhone) {
@@ -443,7 +613,17 @@
                 const data = await res.json();
                 if (data.status === "ok") {
                     currentPhone = data.phone;
+                    if (data.provider) {
+                        currentProvider = data.provider;
+                        localStorage.setItem("movistar_provider", currentProvider);
+                    }
+                    updateProviderUI();
                     document.getElementById("current-phone-text").textContent = currentPhone;
+                    if (data.telegram_bot_token) document.getElementById("tg-token-input").value = data.telegram_bot_token;
+                    if (data.telegram_chat_id) document.getElementById("tg-chat-input").value = data.telegram_chat_id;
+                    if (data.telegram_configured) {
+                        document.getElementById("telegram-status-label").textContent = "Telegram (Activo)";
+                    }
                     hideGateModal();
                     if (!data.has_credentials) {
                         document.getElementById("storage-text").textContent = "- / -";
@@ -497,7 +677,7 @@
                 const res = await fetch("/start_login", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ phone: currentPhone })
+                    body: JSON.stringify({ phone: currentPhone, provider: currentProvider })
                 });
                 const data = await res.json();
 
@@ -577,7 +757,7 @@
                 const res = await fetch("/complete_login", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ phone: currentPhone, code_or_url: codeInput })
+                    body: JSON.stringify({ phone: currentPhone, code_or_url: codeInput, provider: currentProvider })
                 });
                 const data = await res.json();
 
@@ -610,7 +790,7 @@
                 const res = await fetch('/unlink', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ phone: currentPhone })
+                    body: JSON.stringify({ phone: currentPhone, provider: currentProvider })
                 });
                 const data = await res.json();
                 if (data.status === 'ok') {
