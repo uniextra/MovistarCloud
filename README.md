@@ -3,37 +3,44 @@
 [![Docker Hub](https://img.shields.io/badge/Docker-Hub-blue?logo=docker)](https://hub.docker.com/r/uniextra/movistar-cloud)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A comprehensive, robust, and Dockerized solution to automatically bulk-upload photos and videos to **Movistar Cloud España**, fully replicating the behavior of the native Android App (pure Gallery objects, bypassing the virtual file system).
-
-![Movistar Cloud Gallery Screenshot](screenshot.png)
+A high-performance, lightweight, and Dockerized Go-native solution to automatically bulk-upload photos and videos to **Movistar Cloud España**, replicating the behavior of the native Android Gallery app (pure Gallery timeline objects, completely bypassing the virtual filesystem).
 
 ---
 
 ## 🌟 Key Features
 
-### 📸 Native Gallery Behavior
-Reverse-engineered the exact API call used by the Movistar Android app. Uploaded media behaves purely as native "Gallery" items (omitting the `folderid`). They won't clutter the "Files/Ficheros" view and cannot be accidentally deleted from there.
+### ⚡ 100% Native Go & Ultra-Lightweight (~22 MB)
+Rewritten from Python/Chromium/VNC to a compiled static Go binary:
+- **Image size reduced from ~1.3 GB to ~22 MB**.
+- **Memory footprint < 30 MB RAM** during multi-gigabyte uploads thanks to zero-copy `io.Pipe()` multipart streaming.
+- **Single Port**: Only port `5000` is exposed. No virtual desktop, Chromium, or VNC dependencies.
 
-### 🌐 Modern Responsive Web UI (Bilingual)
-- **Automatic Language Detection**: Loads in **Spanish** or **English** based on your browser/OS preferences, with an instant manual toggle (`🌐 ES/EN`).
-- **Expansive Widescreen Virtual Desktop (1600x900)**: Launches an isolated Chromium session running on Xvfb + noVNC directly in an expansive modal. Easily enter your phone number and SMS code; tokens (`JSESSIONID` and `VALIDATIONKEY`) are automatically intercepted, saved, and the modal auto-closes.
-- **Interactive File Explorer**: Visually browse `/data` folders on your NAS or server.
-- **Dynamic Metrics & Dark Terminal**: Real-time KPI counters (✅ Uploaded, ⏭️ Skipped/Duplicates, ❌ Errors) with animated progress bar and dark-mode log stream bounded to 500 lines.
+### 🔑 Official Telefonica OAuth2 PKCE Login
+Replicates the official Movistar Windows Desktop Client authentication:
+- Generates a persistent official Device ID (`fol-...`).
+- Seamless 3-step OAuth2 PKCE authorization modal via official `apiseg.telefonica.es` endpoints.
+- Auto-rotates access and refresh tokens indefinitely.
 
-### 📦 Google Takeout Mode
-A lifesaver for migrating from Google Photos. When enabled:
-- Automatically filters out junk thumbnails (`<40KB` or thumbnail patterns).
-- Reads the accompanying `*.json` sidecar files to extract the exact `photoTakenTime.timestamp`. This avoids the common issue where all exported photos receive today's upload timestamp.
+### 📸 Pure Gallery Timeline Ingestion
+Reverse-engineered SAPI upload protocol:
+- By deliberately omitting `folderid` from the metadata JSON, media is ingested straight into the user's Gallery Timeline.
+- Photos and videos never clutter the generic "Ficheros/Files" directory view.
 
-### 🧠 Smart Duplicate Detection
-Queries the cloud gallery catalog prior to uploading using timeline batches, and caches all progress in a persistent native SQLite database (`/app/tokens/movistar_upload_cache.sqlite`). Resuming cancelled uploads is instantaneous and incurs zero unnecessary bandwidth.
+### 📦 Advanced Google Takeout Mode
+Ported from `immich-go` and Google Takeout reverse engineering findings:
+- Filters junk thumbnails (`<40KB` or thumbnail filenames).
+- Discovers original capture timestamps across 5 rules:
+  1. Standard sidecars and supplemental metadata (`.supplemental-metadata.json`, `-supplemental-metadata.json`).
+  2. Bracket swapping for duplicates (`IMG_1234(1).jpg` ↔ `IMG_1234.jpg(1).json`).
+  3. Google Takeout 46/47/51 character truncation limits.
+  4. Edited photo fallbacks (`-edited`).
+  5. Motion photo / Live photo cross-extension pairing (`.mp4`/`.mov` paired with `.heic`/`.jpg`).
+- Automatic video fallback using modification timestamps (`patchCreationDateForVideos`).
 
-### ⚡ Robust Architecture & Self-Healing
-- **Multi-threaded uploads**: Configurable parallel workers (1–10 threads).
-- **Persistent Session & SQLite Cache**: Named volume `/app/tokens` holds both credentials and upload history across container restarts.
-- **Session Keep-Alive Heartbeat**: Periodic background heartbeat ensures `JSESSIONID` stays alive indefinitely during massive multi-day migrations or idle periods.
-- **Self-Healing X11/VNC**: Services (`Xvfb`, `fluxbox`, `x11vnc`, `websockify`) auto-recover and self-initialize from Python even if run under custom container overrides.
-- **401 Hard-Fail**: Aborts immediately if session cookies expire mid-upload, preventing infinite error loops.
+### 🧠 Smart Multi-Account SQLite Cache (WAL)
+- Isolated cache database per phone account (`/app/tokens/cache_<phone>.sqlite`).
+- Pre-queries cloud gallery inventory on startup to prevent duplicate uploads.
+- Double-check: indexed path/size lookup + MD5 twin detection.
 
 ---
 
@@ -44,8 +51,8 @@ Queries the cloud gallery catalog prior to uploading using timeline batches, and
 ```bash
 docker run -d \
   --name movistar-uploader \
+  --restart unless-stopped \
   -p 5000:5000 \
-  -p 8084:8084 \
   -v /ruta/a/tus/fotos:/data \
   -v movistar_tokens:/app/tokens \
   uniextra/movistar-cloud:latest
@@ -62,8 +69,7 @@ services:
     container_name: movistar-uploader
     restart: unless-stopped
     ports:
-      - "5000:5000"   # Web Dashboard
-      - "8084:8084"   # Virtual Browser (VNC)
+      - "5000:5000"
     volumes:
       - /path/to/your/photos:/data
       - movistar_tokens:/app/tokens
@@ -77,12 +83,16 @@ volumes:
 ## 📖 Usage Guide
 
 1. Open your browser at `http://SERVER_IP:5000`.
-2. Click **🌐 Open Virtual Browser (Login)**.
-3. Enter your phone number and SMS code inside the widescreen Movistar Cloud window.
-4. Once authenticated, the window closes automatically, filling your session keys.
-5. Select your target folder under `/data`, pick your preferred settings (Threads, Recursive, Google Takeout), and hit **Start Upload**!
+2. Enter your mobile phone number in the initial prompt.
+3. If connecting for the first time, click **Vincular Dispositivo (OAuth2)**:
+   - Click **Generar Enlace Seguro de Telefónica**.
+   - Open the link, sign in on the official Movistar page via SMS or password.
+   - Copy the resulting URL or authorization code, paste it into Step 3, and confirm.
+4. Select your media folder under `/data` (use the built-in Folder Browser).
+5. Toggle **Escaneo Recursivo** or **Modo Google Takeout** as needed.
+6. Click **▶ Iniciar Subida a Galería** and monitor live progress in the real-time terminal!
 
 ---
 
 ## ⚠️ Disclaimer
-This is an educational, reverse-engineered project. It is not affiliated with, endorsed by, or maintained by Telefónica or Movistar. Use at your own risk.
+This is an educational, reverse-engineered open source project. It is not affiliated with, endorsed by, or maintained by Telefónica or Movistar.

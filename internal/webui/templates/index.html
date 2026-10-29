@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Movistar Cloud - Galería Uploader (Go)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #f8fafc; }
+        .log-box::-webkit-scrollbar { width: 8px; }
+        .log-box::-webkit-scrollbar-track { background: #0f172a; }
+        .log-box::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        .log-box::-webkit-scrollbar-thumb:hover { background: #475569; }
+    </style>
+</head>
+<body class="p-4 sm:p-6 max-w-6xl mx-auto min-h-screen flex flex-col justify-between">
+    <div>
+        <!-- Header -->
+        <header class="flex flex-wrap items-center justify-between gap-4 mb-6 bg-slate-900/80 backdrop-blur p-5 rounded-2xl border border-slate-800 shadow-xl">
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center shadow-lg shadow-blue-500/20 font-bold text-white text-lg">
+                    ☁
+                </div>
+                <div>
+                    <div class="flex items-center space-x-2">
+                        <h1 class="text-xl font-bold tracking-tight text-white">Movistar Cloud</h1>
+                        <span class="text-[10px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded-md border border-blue-500/30">v2.0 (Go Native)</span>
+                    </div>
+                    <p class="text-xs text-slate-400">Sincronizador Directo a Galería & Timeline</p>
+                </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+                <!-- Phone Pill -->
+                <div id="phone-pill" class="flex items-center space-x-2 px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-xl text-xs">
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span id="current-phone-text" class="font-mono font-semibold text-slate-200">Sin cuenta</span>
+                    <button onclick="promptChangePhone()" class="ml-1 text-slate-400 hover:text-white transition" title="Cambiar cuenta">
+                        ✏️
+                    </button>
+                </div>
+
+                <!-- Storage Pill -->
+                <div id="storage-pill" class="px-3 py-1.5 bg-indigo-950/60 border border-indigo-800/40 text-indigo-300 rounded-xl text-xs font-medium flex items-center space-x-1.5">
+                    <span>💾</span>
+                    <span id="storage-text">Consultando cuota...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 mb-6">
+            <!-- Left Column: Config Panel -->
+            <div class="lg:col-span-5 flex flex-col space-y-6">
+                <div class="bg-slate-900/80 p-5 rounded-2xl border border-slate-800 shadow-xl flex-1 flex flex-col justify-between">
+                    <div>
+                        <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-4 flex items-center">
+                            <span class="mr-2">⚙️</span> Configuración de Subida
+                        </h2>
+
+                        <!-- Directory Selector -->
+                        <div class="mb-4">
+                            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Carpeta de Medios (/data)</label>
+                            <div class="flex space-x-2">
+                                <input type="text" id="folder-path" value="/data" class="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs font-mono text-slate-200 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+                                <button onclick="openFolderBrowser()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-xl text-xs font-medium transition border border-slate-700">
+                                    📁 Explorar
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Checkboxes -->
+                        <div class="space-y-3 mb-6 bg-slate-950/50 p-4 rounded-xl border border-slate-800/60">
+                            <label class="flex items-center space-x-3 cursor-pointer">
+                                <input type="checkbox" id="recursive-toggle" checked class="w-4 h-4 rounded bg-slate-800 border-slate-700 text-blue-600 focus:ring-blue-500">
+                                <div class="text-xs">
+                                    <span class="font-medium text-slate-200">Escaneo Recursivo</span>
+                                    <p class="text-[11px] text-slate-400">Incluye todas las subcarpetas y carpetas anidadas</p>
+                                </div>
+                            </label>
+
+                            <label class="flex items-center space-x-3 cursor-pointer">
+                                <input type="checkbox" id="takeout-toggle" class="w-4 h-4 rounded bg-slate-800 border-slate-700 text-blue-600 focus:ring-blue-500">
+                                <div class="text-xs">
+                                    <span class="font-medium text-slate-200">Modo Google Takeout</span>
+                                    <p class="text-[11px] text-slate-400">Extrae fechas originales desde archivos JSON sidecar</p>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="space-y-2 pt-2">
+                        <button id="start-btn" onclick="startUpload()" class="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold py-3 px-4 rounded-xl shadow-lg shadow-blue-600/20 transition flex items-center justify-center space-x-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed">
+                            <span>▶ Iniciar Subida a Galería</span>
+                        </button>
+                        <button id="stop-btn" onclick="stopUpload()" disabled class="w-full bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 font-semibold py-2.5 px-4 rounded-xl transition text-sm disabled:opacity-30 disabled:cursor-not-allowed">
+                            <span>■ Detener Proceso</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Status & Stats -->
+            <div class="lg:col-span-7 flex flex-col space-y-6">
+                <div class="bg-slate-900/80 p-5 rounded-2xl border border-slate-800 shadow-xl flex-1 flex flex-col justify-between">
+                    <div>
+                        <div class="flex items-center justify-between mb-4">
+                            <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 flex items-center">
+                                <span class="mr-2">📊</span> Estado de la Sincronización
+                            </h2>
+                            <span id="status-badge" class="px-2.5 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+                                En espera
+                            </span>
+                        </div>
+
+                        <!-- Progress Bar -->
+                        <div class="mb-4">
+                            <div class="flex justify-between text-xs mb-1.5 font-mono text-slate-400">
+                                <span>Progreso general</span>
+                                <span id="progress-percent-text" class="font-semibold text-blue-400">0.0%</span>
+                            </div>
+                            <div class="w-full h-3 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+                                <div id="progress-bar-fill" class="h-full bg-gradient-to-r from-blue-500 to-emerald-400 transition-all duration-300 w-0"></div>
+                            </div>
+                            <div class="mt-2 text-xs text-slate-400 truncate font-mono" id="current-file-text">
+                                Archivo: <span class="text-slate-300">-</span>
+                            </div>
+                        </div>
+
+                        <!-- Metric Cards -->
+                        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                            <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-center">
+                                <div class="text-[11px] text-slate-400 font-medium">Total</div>
+                                <div id="stat-total" class="text-lg font-bold font-mono text-white mt-0.5">0</div>
+                            </div>
+                            <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-center">
+                                <div class="text-[11px] text-emerald-400 font-medium">Subidos</div>
+                                <div id="stat-uploaded" class="text-lg font-bold font-mono text-emerald-400 mt-0.5">0</div>
+                            </div>
+                            <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-center">
+                                <div class="text-[11px] text-amber-400 font-medium">Omitidos</div>
+                                <div id="stat-skipped" class="text-lg font-bold font-mono text-amber-400 mt-0.5">0</div>
+                            </div>
+                            <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-center">
+                                <div class="text-[11px] text-rose-400 font-medium">Errores</div>
+                                <div id="stat-errors" class="text-lg font-bold font-mono text-rose-400 mt-0.5">0</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="pt-4 border-t border-slate-800/80 mt-4 flex items-center justify-between text-xs text-slate-400">
+                        <div class="flex items-center space-x-1.5">
+                            <span class="inline-block w-2 h-2 rounded-full bg-blue-500"></span>
+                            <span>Caché SQLite persistente (WAL) activa</span>
+                        </div>
+                        <button onclick="openOAuthModal()" class="text-blue-400 hover:text-blue-300 underline font-medium">
+                            Vincular nuevo dispositivo
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Terminal Logs -->
+        <div class="bg-slate-950 rounded-2xl border border-slate-800 shadow-xl overflow-hidden flex flex-col">
+            <div class="bg-slate-900/90 px-4 py-2.5 border-b border-slate-800 flex items-center justify-between">
+                <div class="flex items-center space-x-2">
+                    <span class="w-3 h-3 rounded-full bg-rose-500/80 inline-block"></span>
+                    <span class="w-3 h-3 rounded-full bg-amber-500/80 inline-block"></span>
+                    <span class="w-3 h-3 rounded-full bg-emerald-500/80 inline-block"></span>
+                    <span class="ml-2 font-mono text-xs text-slate-400 font-semibold">terminal ~ uploader.log</span>
+                </div>
+                <div class="flex items-center space-x-3 text-xs">
+                    <label class="flex items-center space-x-1.5 text-slate-400 cursor-pointer">
+                        <input type="checkbox" id="autoscroll-toggle" checked class="rounded bg-slate-800 border-slate-700 text-blue-600">
+                        <span>Auto-scroll</span>
+                    </label>
+                    <button onclick="clearConsole()" class="text-slate-400 hover:text-slate-200">
+                        Limpiar
+                    </button>
+                </div>
+            </div>
+            <div id="log-box" class="log-box p-4 font-mono text-[11px] text-slate-300 h-64 overflow-y-auto space-y-1">
+                <div class="text-slate-500">[Sistema] Esperando inicio de tareas...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modals -->
+
+    <!-- 1. Privacy Gate Modal -->
+    <div id="phoneGateModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl">
+            <div class="w-12 h-12 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-400 flex items-center justify-center text-xl mb-4">
+                📱
+            </div>
+            <h3 class="text-lg font-bold text-white mb-1">Acceso a Cuenta Movistar</h3>
+            <p class="text-xs text-slate-400 mb-4">Introduce tu número de teléfono móvil para acceder a tu panel y cargar tu caché de subida aislada.</p>
+            
+            <form onsubmit="handleGateSubmit(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-semibold text-slate-300 mb-1">Número de Teléfono</label>
+                    <input type="tel" id="gate-phone-input" placeholder="Ej: 611223344" required class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-2.5 text-sm font-mono text-white outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">
+                </div>
+                <div id="gate-error" class="text-xs text-rose-400 hidden"></div>
+                <button type="submit" id="gate-submit-btn" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2.5 rounded-xl transition text-sm">
+                    Acceder a la Galería
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- 2. Official 3-Step OAuth Modal -->
+    <div id="oauthModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-6 shadow-2xl relative">
+            <button onclick="closeOAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white text-lg">✕</button>
+
+            <div class="flex items-center space-x-3 mb-4">
+                <div class="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center text-lg">
+                    🔑
+                </div>
+                <div>
+                    <h3 class="text-lg font-bold text-white">Vinculación Oficial de Dispositivo</h3>
+                    <p class="text-xs text-slate-400">OAuth2 PKCE oficial de Telefónica (Sin navegadores emulados)</p>
+                </div>
+            </div>
+
+            <div class="space-y-4 text-xs">
+                <!-- Step 1 -->
+                <div class="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80">
+                    <div class="font-bold text-slate-200 mb-1 flex items-center">
+                        <span class="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[11px] mr-2">1</span>
+                        Generar Autorización Oficial
+                    </div>
+                    <p class="text-slate-400 mb-3 ml-7">Inicia el desafío PKCE para el número: <span class="font-mono text-blue-400" id="oauth-target-phone">-</span></p>
+                    <div class="ml-7">
+                        <button onclick="generateOAuthLink()" id="oauth-gen-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg font-medium transition">
+                            Generar Enlace Seguro de Telefónica
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Step 2 -->
+                <div id="step-2-box" class="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80 opacity-50">
+                    <div class="font-bold text-slate-200 mb-1 flex items-center">
+                        <span class="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[11px] mr-2">2</span>
+                        Iniciar Sesión en Movistar
+                    </div>
+                    <p class="text-slate-400 mb-3 ml-7">Abre la página oficial de Telefónica, introduce tu clave o código SMS y confirma el acceso:</p>
+                    <div class="ml-7">
+                        <a id="oauth-link-btn" href="#" target="_blank" class="pointer-events-none inline-flex items-center space-x-1.5 bg-slate-800 text-slate-400 px-4 py-2 rounded-lg font-medium transition">
+                            <span>Abrir Login Oficial Telefónica</span>
+                            <span>↗</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Step 3 -->
+                <div id="step-3-box" class="bg-slate-950/70 p-4 rounded-xl border border-slate-800/80 opacity-50">
+                    <div class="font-bold text-slate-200 mb-1 flex items-center">
+                        <span class="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center text-[11px] mr-2">3</span>
+                        Pegar URL o Código de Retorno
+                    </div>
+                    <p class="text-slate-400 mb-2 ml-7">Al identificarte con éxito, la ventana mostrará una dirección que contiene <code>code=...</code>. Cópiala y pégala aquí:</p>
+                    <div class="ml-7 space-y-2">
+                        <input type="text" id="oauth-code-input" disabled placeholder="Pega aquí la URL completa o el código devuelto" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white outline-none focus:border-emerald-500">
+                        <div id="oauth-finish-error" class="text-rose-400 hidden"></div>
+                        <button onclick="completeOAuthLogin()" id="oauth-finish-btn" disabled class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-medium transition disabled:opacity-40">
+                            Completar Vinculación Permanente
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. Folder Browser Modal -->
+    <div id="folderModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl flex flex-col h-[480px]">
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center space-x-2">
+                    <span class="text-lg">📁</span>
+                    <h3 class="text-base font-bold text-white">Explorador de Carpetas</h3>
+                </div>
+                <button onclick="closeFolderBrowser()" class="text-slate-400 hover:text-white">✕</button>
+            </div>
+
+            <!-- Path Bar -->
+            <div class="flex items-center space-x-2 bg-slate-950 px-3 py-2 rounded-xl border border-slate-800 text-xs font-mono text-blue-400 mb-3">
+                <span class="text-slate-500">Ruta:</span>
+                <span id="browser-current-path" class="truncate">/data</span>
+            </div>
+
+            <!-- Folder list -->
+            <div id="browser-folder-list" class="flex-1 overflow-y-auto space-y-1 bg-slate-950/50 p-2 rounded-xl border border-slate-800/80 mb-4 text-xs font-mono">
+                <div class="text-slate-500 p-2 text-center">Cargando carpetas...</div>
+            </div>
+
+            <div class="flex space-x-2">
+                <button onclick="browserGoUp()" id="browser-up-btn" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-2 rounded-xl text-xs font-semibold transition">
+                    ⬆ Subir Nivel
+                </button>
+                <button onclick="selectCurrentFolder()" class="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-xl text-xs font-semibold transition">
+                    Seleccionar esta carpeta
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentPhone = localStorage.getItem("movistar_phone") || "";
+        let browserPath = "/data";
+
+        window.addEventListener("DOMContentLoaded", () => {
+            if (currentPhone) {
+                verifyPhone(currentPhone);
+            } else {
+                showGateModal();
+            }
+            startPolling();
+        });
+
+        function showGateModal() {
+            document.getElementById("phoneGateModal").classList.remove("hidden");
+        }
+
+        function hideGateModal() {
+            document.getElementById("phoneGateModal").classList.add("hidden");
+        }
+
+        function promptChangePhone() {
+            showGateModal();
+        }
+
+        async function handleGateSubmit(e) {
+            e.preventDefault();
+            const phoneInput = document.getElementById("gate-phone-input").value.trim();
+            const errDiv = document.getElementById("gate-error");
+            const btn = document.getElementById("gate-submit-btn");
+
+            errDiv.classList.add("hidden");
+            btn.disabled = true;
+            btn.textContent = "Verificando...";
+
+            try {
+                const res = await fetch("/verify_phone", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ phone: phoneInput })
+                });
+                const data = await res.json();
+
+                if (data.status === "ok") {
+                    currentPhone = data.phone;
+                    localStorage.setItem("movistar_phone", currentPhone);
+                    document.getElementById("current-phone-text").textContent = currentPhone;
+                    hideGateModal();
+
+                    if (!data.has_credentials) {
+                        openOAuthModal();
+                    } else {
+                        loadStorageInfo();
+                    }
+                } else {
+                    errDiv.textContent = data.message || "Error al verificar teléfono";
+                    errDiv.classList.remove("hidden");
+                }
+            } catch (err) {
+                errDiv.textContent = "Error de red con el servidor local";
+                errDiv.classList.remove("hidden");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "Acceder a la Galería";
+            }
+        }
+
+        async function verifyPhone(phone) {
+            try {
+                const res = await fetch("/verify_phone", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ phone: phone })
+                });
+                const data = await res.json();
+                if (data.status === "ok") {
+                    currentPhone = data.phone;
+                    document.getElementById("current-phone-text").textContent = currentPhone;
+                    hideGateModal();
+                    if (!data.has_credentials) {
+                        openOAuthModal();
+                    } else {
+                        loadStorageInfo();
+                    }
+                } else {
+                    showGateModal();
+                }
+            } catch (e) {
+                showGateModal();
+            }
+        }
+
+        async function loadStorageInfo() {
+            try {
+                const res = await fetch("/storage_info?phone=" + encodeURIComponent(currentPhone));
+                const data = await res.json();
+                if (data.status === "ok") {
+                    document.getElementById("storage-text").textContent = `${data.used_str} / ${data.total_str}`;
+                }
+            } catch (e) {}
+        }
+
+        // OAuth Modal Functions
+        function openOAuthModal() {
+            if (!currentPhone) {
+                showGateModal();
+                return;
+            }
+            document.getElementById("oauth-target-phone").textContent = currentPhone;
+            document.getElementById("oauthModal").classList.remove("hidden");
+        }
+
+        function closeOAuthModal() {
+            document.getElementById("oauthModal").classList.add("hidden");
+        }
+
+        async function generateOAuthLink() {
+            const btn = document.getElementById("oauth-gen-btn");
+            btn.disabled = true;
+            btn.textContent = "Generando URL...";
+
+            try {
+                const res = await fetch("/start_login", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ phone: currentPhone })
+                });
+                const data = await res.json();
+
+                if (data.status === "ok" && data.auth_url) {
+                    const linkBtn = document.getElementById("oauth-link-btn");
+                    linkBtn.href = data.auth_url;
+                    linkBtn.classList.remove("pointer-events-none", "bg-slate-800", "text-slate-400");
+                    linkBtn.classList.add("bg-blue-600", "hover:bg-blue-500", "text-white");
+                    document.getElementById("step-2-box").classList.remove("opacity-50");
+
+                    document.getElementById("step-3-box").classList.remove("opacity-50");
+                    document.getElementById("oauth-code-input").disabled = false;
+                    document.getElementById("oauth-finish-btn").disabled = false;
+                }
+            } catch (e) {
+                alert("Error generando enlace de login");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "Regenerar Enlace";
+            }
+        }
+
+        async function completeOAuthLogin() {
+            const codeInput = document.getElementById("oauth-code-input").value.trim();
+            const errDiv = document.getElementById("oauth-finish-error");
+            const btn = document.getElementById("oauth-finish-btn");
+
+            if (!codeInput) return;
+
+            errDiv.classList.add("hidden");
+            btn.disabled = true;
+            btn.textContent = "Vinculando...";
+
+            try {
+                const res = await fetch("/complete_login", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ phone: currentPhone, code_or_url: codeInput })
+                });
+                const data = await res.json();
+
+                if (data.status === "ok") {
+                    closeOAuthModal();
+                    loadStorageInfo();
+                    alert("¡Dispositivo vinculado con éxito!");
+                } else {
+                    errDiv.textContent = data.message || "Error al completar vinculación";
+                    errDiv.classList.remove("hidden");
+                }
+            } catch (e) {
+                errDiv.textContent = "Error de comunicación";
+                errDiv.classList.remove("hidden");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "Completar Vinculación Permanente";
+            }
+        }
+
+        // Folder Browser Modal Functions
+        function openFolderBrowser() {
+            browserPath = document.getElementById("folder-path").value || "/data";
+            document.getElementById("folderModal").classList.remove("hidden");
+            loadBrowserPath(browserPath);
+        }
+
+        function closeFolderBrowser() {
+            document.getElementById("folderModal").classList.add("hidden");
+        }
+
+        async function loadBrowserPath(path) {
+            browserPath = path;
+            document.getElementById("browser-current-path").textContent = path;
+            const listDiv = document.getElementById("browser-folder-list");
+            listDiv.innerHTML = '<div class="text-slate-500 p-2 text-center">Cargando...</div>';
+
+            try {
+                const res = await fetch("/folders?path=" + encodeURIComponent(path));
+                const data = await res.json();
+                listDiv.innerHTML = "";
+
+                if (data.folders && data.folders.length > 0) {
+                    data.folders.forEach(f => {
+                        const row = document.createElement("div");
+                        row.className = "flex items-center justify-between p-2 hover:bg-slate-800 rounded-lg cursor-pointer transition text-slate-300";
+                        row.innerHTML = `<span>📁 ${f.name}</span><span class="text-slate-500 text-[10px]">Entrar →</span>`;
+                        row.onclick = () => loadBrowserPath(f.path);
+                        listDiv.appendChild(row);
+                    });
+                } else {
+                    listDiv.innerHTML = '<div class="text-slate-500 p-2 text-center">Sin subcarpetas</div>';
+                }
+
+                document.getElementById("browser-up-btn").disabled = (path === "/data" || path === "/data/");
+            } catch (e) {
+                listDiv.innerHTML = '<div class="text-rose-400 p-2 text-center">Error listando carpetas</div>';
+            }
+        }
+
+        function browserGoUp() {
+            if (browserPath === "/data" || browserPath === "/data/") return;
+            const parts = browserPath.split("/").filter(Boolean);
+            parts.pop();
+            const parent = "/" + parts.join("/");
+            loadBrowserPath(parent.startsWith("/data") ? parent : "/data");
+        }
+
+        function selectCurrentFolder() {
+            document.getElementById("folder-path").value = browserPath;
+            closeFolderBrowser();
+        }
+
+        // Upload Control Functions
+        async function startUpload() {
+            if (!currentPhone) {
+                showGateModal();
+                return;
+            }
+
+            const folder = document.getElementById("folder-path").value;
+            const recursive = document.getElementById("recursive-toggle").checked;
+            const takeout = document.getElementById("takeout-toggle").checked;
+
+            const btn = document.getElementById("start-btn");
+            btn.disabled = true;
+
+            try {
+                const res = await fetch("/start", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        phone: currentPhone,
+                        folder: folder,
+                        recursive: recursive,
+                        takeout: takeout
+                    })
+                });
+                const data = await res.json();
+                if (data.status !== "ok") {
+                    alert(data.message || "Error al iniciar subida");
+                }
+            } catch (e) {
+                alert("Error de conexión");
+            }
+        }
+
+        async function stopUpload() {
+            try {
+                await fetch("/stop", { method: "POST" });
+            } catch (e) {}
+        }
+
+        function clearConsole() {
+            document.getElementById("log-box").innerHTML = "";
+        }
+
+        // Polling status and logs
+        function startPolling() {
+            setInterval(async () => {
+                try {
+                    const res = await fetch("/logs?phone=" + encodeURIComponent(currentPhone));
+                    const data = await res.json();
+
+                    // Update logs
+                    if (data.logs) {
+                        const box = document.getElementById("log-box");
+                        box.innerHTML = data.logs.map(line => {
+                            let color = "text-slate-300";
+                            if (line.includes("[OK]")) color = "text-emerald-400";
+                            else if (line.includes("[SKIP]")) color = "text-amber-300";
+                            else if (line.includes("[ERROR]") || line.includes("❌")) color = "text-rose-400 font-semibold";
+                            else if (line.includes("[UPLOAD]")) color = "text-blue-300";
+                            return `<div class="${color} break-all">${line}</div>`;
+                        }).join("");
+
+                        if (document.getElementById("autoscroll-toggle").checked) {
+                            box.scrollTop = box.scrollHeight;
+                        }
+                    }
+
+                    // Update stats
+                    if (data.stats) {
+                        const s = data.stats;
+                        document.getElementById("stat-total").textContent = s.total_files || 0;
+                        document.getElementById("stat-uploaded").textContent = s.uploaded_count || 0;
+                        document.getElementById("stat-skipped").textContent = s.skipped_count || 0;
+                        document.getElementById("stat-errors").textContent = s.error_count || 0;
+
+                        const pct = s.percent ? s.percent.toFixed(1) : "0.0";
+                        document.getElementById("progress-percent-text").textContent = pct + "%";
+                        document.getElementById("progress-bar-fill").style.width = pct + "%";
+                        document.getElementById("current-file-text").innerHTML = s.current_file ? `Archivo: <span class="text-slate-200">${s.current_file}</span>` : 'Archivo: <span class="text-slate-400">-</span>';
+
+                        // Badge & buttons
+                        const badge = document.getElementById("status-badge");
+                        const startBtn = document.getElementById("start-btn");
+                        const stopBtn = document.getElementById("stop-btn");
+
+                        if (s.state === "running") {
+                            badge.textContent = "Subiendo...";
+                            badge.className = "px-2.5 py-1 text-xs font-semibold rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse";
+                            startBtn.disabled = true;
+                            stopBtn.disabled = false;
+                        } else if (s.state === "scanning") {
+                            badge.textContent = "Escaneando...";
+                            badge.className = "px-2.5 py-1 text-xs font-semibold rounded-full bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 animate-pulse";
+                            startBtn.disabled = true;
+                            stopBtn.disabled = false;
+                        } else if (s.state === "completed") {
+                            badge.textContent = "Completado";
+                            badge.className = "px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
+                            startBtn.disabled = false;
+                            stopBtn.disabled = true;
+                        } else if (s.state === "stopped") {
+                            badge.textContent = "Detenido";
+                            badge.className = "px-2.5 py-1 text-xs font-semibold rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30";
+                            startBtn.disabled = false;
+                            stopBtn.disabled = true;
+                        } else {
+                            badge.textContent = "En espera";
+                            badge.className = "px-2.5 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-300 border border-slate-700";
+                            startBtn.disabled = false;
+                            stopBtn.disabled = true;
+                        }
+                    }
+                } catch (e) {}
+            }, 1000);
+        }
+    </script>
+</body>
+</html>
