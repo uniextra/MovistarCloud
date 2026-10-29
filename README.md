@@ -1,4 +1,4 @@
-# Movistar Cloud Gallery Uploader ☁️
+# Movistar / O2 Cloud Gallery Uploader ☁️
 
 [![Docker Hub](https://img.shields.io/badge/Docker-Hub-blue?logo=docker)](https://hub.docker.com/r/uniextra/movistar-cloud)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -6,7 +6,7 @@
 A high-performance, lightweight, and Dockerized Go-native solution to automatically bulk-upload photos and videos to **Movistar Cloud** and **O2 Cloud España**, replicating the behavior of the native Android Gallery app (pure Gallery timeline objects, completely bypassing the virtual filesystem).
 
 <p align="center">
-  <img src="screenshot.png" alt="Movistar Cloud Gallery Uploader Web UI" width="100%">
+  <img src="screenshot.png" alt="Movistar / O2 Cloud Gallery Uploader Web UI" width="100%">
 </p>
 
 ---
