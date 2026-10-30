@@ -15,7 +15,7 @@ import (
 	"movistar-cloud-uploader/internal/webui"
 )
 
-const AppVersion = "v2.0.0"
+const AppVersion = "v2.0.2"
 
 func main() {
 	logger.Log("=====================================================")
