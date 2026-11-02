@@ -7,6 +7,19 @@ ENV/
 env.bak/
 venv.bak/
 
+# Movistar Credentials and Tokens
+tokens/
+/tokens/
+account_*.env
+*.env
+.movistar-cloud-device-id
+*.sqlite
+*.sqlite*
+
+# Binaries
+movistar-uploader
+*.exe
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -27,9 +40,6 @@ __pycache__/
 *.swp
 *.swo
 
-# Movistar specific
-.movistar-cloud-device-id
-*.sqlite
-*.sqlite*
+# Migration scripts
 migrate_*.py
 migrate*

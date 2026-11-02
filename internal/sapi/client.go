@@ -326,6 +326,7 @@ func (c *Client) DoRequest(req *http.Request) (*http.Response, error) {
 		if req.Body != nil && req.GetBody == nil {
 			return resp, nil
 		}
+		origBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 
 		if c.HasCredentials() && c.RefreshSession() {
@@ -357,14 +358,24 @@ func (c *Client) DoRequest(req *http.Request) (*http.Response, error) {
 			}
 			return resp2, err2
 		}
+
+		resp.Body = io.NopCloser(bytes.NewReader(origBody))
+		return resp, nil
 	}
 
 	return resp, nil
 }
 
 func (c *Client) GetStorageSpace() (*StorageSpace, error) {
-	u := fmt.Sprintf("%s/sapi/user/storage/space?action=get", c.baseURL)
-	req, err := http.NewRequest("GET", u, nil)
+	c.mu.RLock()
+	baseURL := c.baseURL
+	c.mu.RUnlock()
+
+	u := fmt.Sprintf("%s/sapi/user/storage/space?action=get", baseURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -428,107 +439,120 @@ func (c *Client) GetStorageSpace() (*StorageSpace, error) {
 func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 	logger.Log("[SAPI] Obteniendo inventario de la Galería en Movistar Cloud para control de duplicados...")
 
+	c.mu.RLock()
+	baseURL := c.baseURL
+	c.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
 	// Strategy 1: Timeline (/sapi/media/timeline?action=get)
-	timelineURL := fmt.Sprintf("%s/sapi/media/timeline?action=get", c.baseURL)
+	timelineURL := fmt.Sprintf("%s/sapi/media/timeline?action=get", baseURL)
 	timelineBody := []byte(`{"data":{"granularity":"daily","sortorder":"creationdate"}}`)
 
-	req, err := http.NewRequest("POST", timelineURL, bytes.NewReader(timelineBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", timelineURL, bytes.NewReader(timelineBody))
 	if err == nil {
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := c.DoRequest(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
+		if err == nil {
 			defer resp.Body.Close()
-			var tRoot struct {
-				Data struct {
-					Timeline []struct {
-						Media []struct {
-							ID   interface{} `json:"id"`
-							Name string      `json:"name"`
-							Size interface{} `json:"size"`
-						} `json:"media"`
-						IDs []interface{} `json:"ids"`
-					} `json:"timeline"`
-				} `json:"data"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&tRoot); err == nil {
-				var items []CloudItem
-				var pendingIDs []int64
-
-				for _, section := range tRoot.Data.Timeline {
-					for _, m := range section.Media {
-						name := m.Name
-						size := parseFlexibleInt(m.Size)
-						id := parseFlexibleInt(m.ID)
-						if name != "" && size > 0 {
-							items = append(items, CloudItem{ID: id, Name: name, Size: size})
-						}
-					}
-					for _, idVal := range section.IDs {
-						if id := parseFlexibleInt(idVal); id > 0 {
-							pendingIDs = append(pendingIDs, id)
-						}
-					}
+			if resp.StatusCode == http.StatusOK {
+				var tRoot struct {
+					Data struct {
+						Timeline []struct {
+							Media []struct {
+								ID   interface{} `json:"id"`
+								Name string      `json:"name"`
+								Size interface{} `json:"size"`
+							} `json:"media"`
+							IDs []interface{} `json:"ids"`
+						} `json:"timeline"`
+					} `json:"data"`
 				}
+				if err := json.NewDecoder(resp.Body).Decode(&tRoot); err == nil {
+					var items []CloudItem
+					var pendingIDs []int64
 
-				// If section.IDs were returned instead of full objects, fetch in chunks of 50
-				if len(pendingIDs) > 0 {
-					for i := 0; i < len(pendingIDs); i += 50 {
-						end := i + 50
-						if end > len(pendingIDs) {
-							end = len(pendingIDs)
+					for _, section := range tRoot.Data.Timeline {
+						for _, m := range section.Media {
+							name := m.Name
+							size := parseFlexibleInt(m.Size)
+							id := parseFlexibleInt(m.ID)
+							if name != "" && size > 0 {
+								items = append(items, CloudItem{ID: id, Name: name, Size: size})
+							}
 						}
-						chunk := pendingIDs[i:end]
-						var idPayload struct {
-							Data struct {
-								IDs []map[string]int64 `json:"ids"`
-							} `json:"data"`
+						for _, idVal := range section.IDs {
+							if id := parseFlexibleInt(idVal); id > 0 {
+								pendingIDs = append(pendingIDs, id)
+							}
 						}
-						for _, id := range chunk {
-							idPayload.Data.IDs = append(idPayload.Data.IDs, map[string]int64{"id": id})
-						}
-						chunkBytes, _ := json.Marshal(idPayload)
-						chunkReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/sapi/media?action=get", c.baseURL), bytes.NewReader(chunkBytes))
-						chunkReq.Header.Set("Content-Type", "application/json")
-						if chunkResp, err := c.DoRequest(chunkReq); err == nil && chunkResp.StatusCode == http.StatusOK {
-							var chunkRoot struct {
+					}
+
+					// If section.IDs were returned instead of full objects, fetch in chunks of 50
+					if len(pendingIDs) > 0 {
+						for i := 0; i < len(pendingIDs); i += 50 {
+							end := i + 50
+							if end > len(pendingIDs) {
+								end = len(pendingIDs)
+							}
+							chunk := pendingIDs[i:end]
+							var idPayload struct {
 								Data struct {
-									Media []struct {
-										ID   interface{} `json:"id"`
-										Name string      `json:"name"`
-										Size interface{} `json:"size"`
-									} `json:"media"`
+									IDs []map[string]int64 `json:"ids"`
 								} `json:"data"`
 							}
-							_ = json.NewDecoder(chunkResp.Body).Decode(&chunkRoot)
-							chunkResp.Body.Close()
-							for _, m := range chunkRoot.Data.Media {
-								name := m.Name
-								size := parseFlexibleInt(m.Size)
-								id := parseFlexibleInt(m.ID)
-								if name != "" && size > 0 {
-									items = append(items, CloudItem{ID: id, Name: name, Size: size})
+							for _, id := range chunk {
+								idPayload.Data.IDs = append(idPayload.Data.IDs, map[string]int64{"id": id})
+							}
+							chunkBytes, _ := json.Marshal(idPayload)
+							chunkReq, _ := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/sapi/media?action=get", baseURL), bytes.NewReader(chunkBytes))
+							chunkReq.Header.Set("Content-Type", "application/json")
+							if chunkResp, err := c.DoRequest(chunkReq); err == nil {
+								if chunkResp.StatusCode == http.StatusOK {
+									var chunkRoot struct {
+										Data struct {
+											Media []struct {
+												ID   interface{} `json:"id"`
+												Name string      `json:"name"`
+												Size interface{} `json:"size"`
+											} `json:"media"`
+										} `json:"data"`
+									}
+									_ = json.NewDecoder(chunkResp.Body).Decode(&chunkRoot)
+									for _, m := range chunkRoot.Data.Media {
+										name := m.Name
+										size := parseFlexibleInt(m.Size)
+										id := parseFlexibleInt(m.ID)
+										if name != "" && size > 0 {
+											items = append(items, CloudItem{ID: id, Name: name, Size: size})
+										}
+									}
 								}
+								_ = chunkResp.Body.Close()
 							}
 						}
 					}
-				}
 
-				if len(items) > 0 {
-					logger.Log("[SAPI] ✔ Inventario en la nube cargado vía Timeline: %d elementos.", len(items))
-					return items, nil
+					if len(items) > 0 {
+						logger.Log("[SAPI] ✔ Inventario en la nube cargado vía Timeline: %d elementos.", len(items))
+						return items, nil
+					}
 				}
 			}
 		}
 	}
 
 	// Strategy 2: /sapi/media?action=get&limit=5000
-	mediaURL := fmt.Sprintf("%s/sapi/media?action=get&limit=5000", c.baseURL)
+	mediaURL := fmt.Sprintf("%s/sapi/media?action=get&limit=5000", baseURL)
 	mediaBody := []byte(`{"data":{"fields":["name","size","folder","origin"]}}`)
-	req2, err := http.NewRequest("POST", mediaURL, bytes.NewReader(mediaBody))
+	req2, err := http.NewRequestWithContext(ctx, "POST", mediaURL, bytes.NewReader(mediaBody))
 	if err == nil {
 		req2.Header.Set("Content-Type", "application/json")
 		resp, err := c.DoRequest(req2)
-		if err == nil && resp.StatusCode == http.StatusOK {
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
 			defer resp.Body.Close()
 			var mRoot struct {
 				Data struct {
@@ -652,6 +676,7 @@ func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTi
 		req.Header.Set("Content-Type", mpw.FormDataContentType())
 
 		resp, err := c.DoRequest(req)
+		_ = pr.Close()
 		if err != nil {
 			return CloudUploadResult{}, err
 		}

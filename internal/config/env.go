@@ -148,6 +148,15 @@ func LoadAccountConfig(phone string) AccountConfig {
 	return cfg
 }
 
+func sanitizeEnvValue(val string) (string, error) {
+	if strings.ContainsAny(val, "\n\r\x00") {
+		return "", fmt.Errorf("invalid value: contains newline or null bytes")
+	}
+	escaped := strings.ReplaceAll(val, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return escaped, nil
+}
+
 func SaveAccountConfig(cfg AccountConfig) error {
 	fileLock.Lock()
 	defer fileLock.Unlock()
@@ -157,7 +166,7 @@ func SaveAccountConfig(cfg AccountConfig) error {
 		return fmt.Errorf("cannot save account configuration without a valid phone number")
 	}
 
-	if err := os.MkdirAll(TokensDir, 0755); err != nil {
+	if err := os.MkdirAll(TokensDir, 0700); err != nil {
 		return err
 	}
 
@@ -166,36 +175,48 @@ func SaveAccountConfig(cfg AccountConfig) error {
 		prov = "movistar"
 	}
 
+	safeProv, _ := sanitizeEnvValue(prov)
+	safePhone, _ := sanitizeEnvValue(phoneClean)
+	safeJSession, _ := sanitizeEnvValue(cfg.JSessionID)
+	safeVK, _ := sanitizeEnvValue(cfg.ValidationKey)
+
 	lines := []string{
-		fmt.Sprintf(`MOVISTAR_PROVIDER="%s"`, prov),
-		fmt.Sprintf(`MOVISTAR_PHONE="%s"`, phoneClean),
-		fmt.Sprintf(`MOVISTAR_JSESSIONID="%s"`, cfg.JSessionID),
-		fmt.Sprintf(`MOVISTAR_VALIDATIONKEY="%s"`, cfg.ValidationKey),
+		fmt.Sprintf(`MOVISTAR_PROVIDER="%s"`, safeProv),
+		fmt.Sprintf(`MOVISTAR_PHONE="%s"`, safePhone),
+		fmt.Sprintf(`MOVISTAR_JSESSIONID="%s"`, safeJSession),
+		fmt.Sprintf(`MOVISTAR_VALIDATIONKEY="%s"`, safeVK),
 	}
 
 	if cfg.DeviceID != "" {
-		lines = append(lines, fmt.Sprintf(`MOVISTAR_DEVICE_ID="%s"`, cfg.DeviceID))
+		safeDevID, _ := sanitizeEnvValue(cfg.DeviceID)
+		lines = append(lines, fmt.Sprintf(`MOVISTAR_DEVICE_ID="%s"`, safeDevID))
 	}
 	if cfg.DeviceName != "" {
-		lines = append(lines, fmt.Sprintf(`MOVISTAR_DEVICE_NAME="%s"`, cfg.DeviceName))
+		safeDevName, _ := sanitizeEnvValue(cfg.DeviceName)
+		lines = append(lines, fmt.Sprintf(`MOVISTAR_DEVICE_NAME="%s"`, safeDevName))
 	}
 	if cfg.RefreshToken != "" {
-		lines = append(lines, fmt.Sprintf(`MOVISTAR_REFRESH_TOKEN="%s"`, cfg.RefreshToken))
+		safeRT, _ := sanitizeEnvValue(cfg.RefreshToken)
+		lines = append(lines, fmt.Sprintf(`MOVISTAR_REFRESH_TOKEN="%s"`, safeRT))
 	}
 	if cfg.AccessToken != "" {
-		lines = append(lines, fmt.Sprintf(`MOVISTAR_ACCESS_TOKEN="%s"`, cfg.AccessToken))
+		safeAT, _ := sanitizeEnvValue(cfg.AccessToken)
+		lines = append(lines, fmt.Sprintf(`MOVISTAR_ACCESS_TOKEN="%s"`, safeAT))
 	}
 	lines = append(lines, fmt.Sprintf(`MOVISTAR_LAST_REFRESH_DATE="%d"`, cfg.LastRefreshDate))
 	if cfg.ExpiresIn != "" {
-		lines = append(lines, fmt.Sprintf(`MOVISTAR_EXPIRES_IN="%s"`, cfg.ExpiresIn))
+		safeExp, _ := sanitizeEnvValue(cfg.ExpiresIn)
+		lines = append(lines, fmt.Sprintf(`MOVISTAR_EXPIRES_IN="%s"`, safeExp))
 	} else {
 		lines = append(lines, `MOVISTAR_EXPIRES_IN="3600"`)
 	}
 	if cfg.TelegramBotToken != "" {
-		lines = append(lines, fmt.Sprintf(`MOVISTAR_TELEGRAM_BOT_TOKEN="%s"`, cfg.TelegramBotToken))
+		safeTGToken, _ := sanitizeEnvValue(cfg.TelegramBotToken)
+		lines = append(lines, fmt.Sprintf(`MOVISTAR_TELEGRAM_BOT_TOKEN="%s"`, safeTGToken))
 	}
 	if cfg.TelegramChatID != "" {
-		lines = append(lines, fmt.Sprintf(`MOVISTAR_TELEGRAM_CHAT_ID="%s"`, cfg.TelegramChatID))
+		safeTGChat, _ := sanitizeEnvValue(cfg.TelegramChatID)
+		lines = append(lines, fmt.Sprintf(`MOVISTAR_TELEGRAM_CHAT_ID="%s"`, safeTGChat))
 	}
 
 	content := strings.Join(lines, "\n") + "\n"

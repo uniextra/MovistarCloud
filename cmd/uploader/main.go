@@ -35,8 +35,12 @@ func main() {
 	}
 
 	uiHTTP := &http.Server{
-		Addr:    ":" + webPort,
-		Handler: uiServer.Routes(),
+		Addr:              ":" + webPort,
+		Handler:           uiServer.Routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

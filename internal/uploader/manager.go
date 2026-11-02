@@ -57,6 +57,7 @@ type JobManager struct {
 	overlay    *cache.OverlayStore
 	mu         sync.RWMutex
 	cancelFunc context.CancelFunc
+	pipelineWG sync.WaitGroup
 
 	state       string
 	phone       string
@@ -146,22 +147,32 @@ func (m *JobManager) GetStatus() JobStats {
 
 func (m *JobManager) StopJob() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.cancelFunc != nil {
 		m.cancelFunc()
 		m.cancelFunc = nil
 	}
 	if m.state == "running" || m.state == "scanning" {
-		m.state = "stopped"
-		logger.Log("[Job] ■ Subida detenida por el usuario.")
+		m.state = "stopping"
+		logger.Log("[Job] ■ Deteniendo proceso de subida...")
 	}
+	m.mu.Unlock()
+
+	go func() {
+		m.pipelineWG.Wait()
+		m.mu.Lock()
+		if m.state == "stopping" {
+			m.state = "stopped"
+			logger.Log("[Job] ■ Subida detenida completamente.")
+		}
+		m.mu.Unlock()
+	}()
 }
 
 func (m *JobManager) StartJob(phone, folder string, recursive, takeout bool) error {
 	m.mu.Lock()
-	if m.state == "scanning" || m.state == "running" {
+	if m.state == "scanning" || m.state == "running" || m.state == "stopping" {
 		m.mu.Unlock()
-		return fmt.Errorf("ya hay un proceso de subida en curso")
+		return fmt.Errorf("ya hay un proceso de subida en curso o deteniéndose")
 	}
 
 	phoneClean := config.SanitizePhone(phone)
@@ -196,9 +207,14 @@ func (m *JobManager) StartJob(phone, folder string, recursive, takeout bool) err
 	atomic.StoreInt64(&m.uploadedCount, 0)
 	atomic.StoreInt64(&m.skippedCount, 0)
 	atomic.StoreInt64(&m.errorCount, 0)
+
+	m.pipelineWG.Add(1)
 	m.mu.Unlock()
 
-	go m.runPipeline(ctx, phoneClean, folder, recursive, takeout)
+	go func() {
+		defer m.pipelineWG.Done()
+		m.runPipeline(ctx, phoneClean, folder, recursive, takeout)
+	}()
 	return nil
 }
 
@@ -208,6 +224,8 @@ func (m *JobManager) runPipeline(ctx context.Context, phone, folder string, recu
 		if m.state == "running" || m.state == "scanning" {
 			m.state = "completed"
 			logger.Log("[Job] ✔ Proceso de subida finalizado.")
+		} else if m.state == "stopping" {
+			m.state = "stopped"
 		}
 		durationSec := int64(time.Since(m.startTime).Seconds())
 		m.mu.Unlock()
@@ -235,7 +253,12 @@ func (m *JobManager) runPipeline(ctx context.Context, phone, folder string, recu
 		logger.Log("[Cache] ⚠️ Error abriendo caché SQLite principal (%v), intentando memoria...", err)
 		uploadCache, _ = cache.OpenCache(":memory:")
 	}
-	defer uploadCache.Close()
+	if uploadCache != nil {
+		defer uploadCache.Close()
+	} else {
+		logger.Log("[Cache] ❌ Error crítico: no se pudo abrir la base de datos de caché")
+		return
+	}
 
 	// 2. Fetch cloud inventory for duplicate control
 	cloudItems, err := m.client.GetGalleryInventory()

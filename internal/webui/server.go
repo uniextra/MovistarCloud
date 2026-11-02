@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"movistar-cloud-uploader/internal/auth"
 	"movistar-cloud-uploader/internal/config"
 	"movistar-cloud-uploader/internal/logger"
+	"movistar-cloud-uploader/internal/notifier"
 	"movistar-cloud-uploader/internal/sapi"
 	"movistar-cloud-uploader/internal/uploader"
 )
@@ -30,6 +32,7 @@ type Server struct {
 	jobManager *uploader.JobManager
 	loginMu    sync.Mutex
 	loginState map[string]*pendingLogin
+	authCfg    config.AuthConfig
 }
 
 type pendingLogin struct {
@@ -44,6 +47,7 @@ func NewServer(client *sapi.Client, jobManager *uploader.JobManager) *Server {
 		client:     client,
 		jobManager: jobManager,
 		loginState: make(map[string]*pendingLogin),
+		authCfg:    config.LoadWebUIAuthConfig(),
 	}
 }
 
@@ -67,7 +71,65 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/test_telegram", s.handleTestTelegram)
 	mux.HandleFunc("/save_telegram", s.handleSaveTelegram)
 
-	return mux
+	return s.securityMiddleware(mux)
+}
+
+func (s *Server) securityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+
+		if r.URL.Path == "/health" || r.URL.Path == "/favicon.ico" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if s.authCfg.IsEnabled() {
+			user, pass, ok := r.BasicAuth()
+			if !ok || !s.authCfg.Validate(user, pass) {
+				w.Header().Set("WWW-Authenticate", `Basic realm="Movistar / O2 Gallery Uploader"`)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		if r.Method == http.MethodPost {
+			if !validateSameOrigin(r) {
+				http.Error(w, "Forbidden: CSRF check failed", http.StatusForbidden)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func validateSameOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, target interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(target); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]interface{}{
+			"status":  "error",
+			"message": "Cuerpo JSON inválido o excede el límite permitido",
+		})
+		return false
+	}
+	return true
 }
 
 func jsonResponse(w http.ResponseWriter, status int, data interface{}) {
@@ -93,11 +155,11 @@ func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok", "version": "v2.0.1"})
+	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok", "version": "v2.0.2"})
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, map[string]interface{}{"version": "v2.0.1"})
+	jsonResponse(w, http.StatusOK, map[string]interface{}{"version": "v2.0.2"})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +174,9 @@ func (s *Server) handleVerifyPhone(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Phone string `json:"phone"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
 	phone := config.SanitizePhone(body.Phone)
 	if phone == "" {
 		jsonResponse(w, http.StatusBadRequest, map[string]interface{}{"status": "error", "message": "Teléfono inválido"})
@@ -129,7 +193,7 @@ func (s *Server) handleVerifyPhone(w http.ResponseWriter, r *http.Request) {
 		"has_credentials":     hasCredentials,
 		"device_id":           cfg.DeviceID,
 		"telegram_configured": cfg.TelegramBotToken != "" && cfg.TelegramChatID != "",
-		"telegram_bot_token":  cfg.TelegramBotToken,
+		"telegram_bot_token":  "", // Redacted for security
 		"telegram_chat_id":    cfg.TelegramChatID,
 	})
 }
@@ -146,30 +210,38 @@ func (s *Server) handleStorageInfo(w http.ResponseWriter, r *http.Request) {
 	if !s.client.HasCredentials() {
 		jsonResponse(w, http.StatusOK, map[string]interface{}{
 			"status":    "unconfigured",
-			"message":   "Dispositivo no vinculado",
 			"used_str":  "-",
 			"total_str": "-",
+			"free_str":  "-",
 		})
 		return
 	}
 
 	space, err := s.client.GetStorageSpace()
 	if err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]interface{}{"status": "error", "message": err.Error()})
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"status":    "error",
+			"message":   err.Error(),
+			"used_str":  "-",
+			"total_str": "-",
+		})
 		return
 	}
 
-	formatBytes := func(b int64) string {
+	formatBytes := func(bytes int64) string {
+		if bytes <= 0 {
+			return "0 B"
+		}
 		const unit = 1024
-		if b < unit {
-			return fmt.Sprintf("%d B", b)
+		if bytes < unit {
+			return fmt.Sprintf("%d B", bytes)
 		}
 		div, exp := int64(unit), 0
-		for n := b / unit; n >= unit; n /= unit {
+		for n := bytes / unit; n >= unit; n /= unit {
 			div *= unit
 			exp++
 		}
-		return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+		return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 	}
 
 	usedStr := formatBytes(space.UsedBytes)
@@ -179,12 +251,11 @@ func (s *Server) handleStorageInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"status":      "ok",
-		"used_bytes":  space.UsedBytes,
-		"total_bytes": space.TotalBytes,
-		"used_str":    usedStr,
-		"total_str":   totalStr,
-		"nolimit":     space.NoLimit,
+		"status":     "ok",
+		"used_bytes": space.UsedBytes,
+		"used_str":   usedStr,
+		"total_str":  totalStr,
+		"no_limit":   space.NoLimit,
 	})
 }
 
@@ -194,9 +265,9 @@ func (s *Server) handleFolders(w http.ResponseWriter, r *http.Request) {
 		requestedPath = "/data"
 	}
 
-	cleanPath := filepath.Clean(requestedPath)
+	cleanPath := filepath.ToSlash(filepath.Clean(requestedPath))
 	// Restrict browsing strictly to /data root
-	if !strings.HasPrefix(cleanPath, "/data") {
+	if cleanPath != "/data" && !strings.HasPrefix(cleanPath, "/data/") {
 		cleanPath = "/data"
 	}
 
@@ -239,8 +310,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		Recursive bool   `json:"recursive"`
 		Takeout   bool   `json:"takeout"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonResponse(w, http.StatusBadRequest, map[string]interface{}{"status": "error", "message": "JSON inválido"})
+	if !decodeJSONBody(w, r, &body) {
 		return
 	}
 
@@ -250,9 +320,16 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	folder := body.Folder
-	if folder == "" {
+	folder := filepath.ToSlash(filepath.Clean(body.Folder))
+	if folder == "" || folder == "." {
 		folder = "/data"
+	}
+	if folder != "/data" && !strings.HasPrefix(folder, "/data/") {
+		jsonResponse(w, http.StatusBadRequest, map[string]interface{}{
+			"status":  "error",
+			"message": "Acceso denegado: la ruta de medios debe estar estrictamente dentro de /data",
+		})
+		return
 	}
 
 	if err := s.jobManager.StartJob(phone, folder, body.Recursive, body.Takeout); err != nil {
@@ -269,9 +346,21 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	phone := config.SanitizePhone(r.URL.Query().Get("phone"))
+	logs := logger.GetRecentLogs(100)
+	stats := s.jobManager.GetStatus()
+
+	if phone != "" && stats.Phone != "" && stats.Phone != phone {
+		stats = uploader.JobStats{
+			State: "idle",
+			Phone: phone,
+		}
+	}
+
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"logs":  logger.GetLogs(),
-		"stats": s.jobManager.GetStatus(),
+		"status": "ok",
+		"logs":   logs,
+		"stats":  stats,
 	})
 }
 
@@ -280,7 +369,9 @@ func (s *Server) handleStartLogin(w http.ResponseWriter, r *http.Request) {
 		Phone    string `json:"phone"`
 		Provider string `json:"provider"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
 	phone := config.SanitizePhone(body.Phone)
 	if phone == "" {
 		jsonResponse(w, http.StatusBadRequest, map[string]interface{}{"status": "error", "message": "Introduce un teléfono válido"})
@@ -295,11 +386,17 @@ func (s *Server) handleStartLogin(w http.ResponseWriter, r *http.Request) {
 	verifier, state, authURL := auth.BuildOAuthLoginURL(provider)
 
 	s.loginMu.Lock()
+	now := time.Now()
+	for k, v := range s.loginState {
+		if now.Sub(v.Time) > 10*time.Minute {
+			delete(s.loginState, k)
+		}
+	}
 	s.loginState[phone] = &pendingLogin{
 		Provider: provider,
 		Verifier: verifier,
 		State:    state,
-		Time:     time.Now(),
+		Time:     now,
 	}
 	s.loginMu.Unlock()
 
@@ -317,7 +414,9 @@ func (s *Server) handleCompleteLogin(w http.ResponseWriter, r *http.Request) {
 		CodeOrURL string `json:"code_or_url"`
 		Provider  string `json:"provider"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
 	phone := config.SanitizePhone(body.Phone)
 	rawCode := body.CodeOrURL
 
@@ -367,7 +466,7 @@ func (s *Server) handleCompleteLogin(w http.ResponseWriter, r *http.Request) {
 	nowMS := time.Now().UnixMilli()
 	sapiRes := auth.SAPILoginOAuth(nil, sapiBase, tokens.AccessToken, tokens.RefreshToken, devID, "PC Windows", nowMS, strconv.Itoa(tokens.ExpiresIn))
 
-	if sapiRes.StatusCode != http.StatusOK && (sapiRes.ValidationKey == "" && sapiRes.JSessionID == "") {
+	if sapiRes.StatusCode != http.StatusOK || (sapiRes.ValidationKey == "" && sapiRes.JSessionID == "") {
 		logger.Log("[OAuth] ❌ Error inicializando sesión SAPI (HTTP %d): %v", sapiRes.StatusCode, sapiRes.Error)
 		provLabel := "Movistar Cloud"
 		if provider == "o2" {
@@ -420,12 +519,25 @@ func (s *Server) handleCompleteLogin(w http.ResponseWriter, r *http.Request) {
 	s.loginMu.Unlock()
 
 	s.client.SetConfig(cfg)
-	if cfg.TelegramBotToken != "" && cfg.TelegramChatID != "" {
-		s.jobManager.GetNotifier().UpdateCredentials(cfg.TelegramBotToken, cfg.TelegramChatID)
-	}
-
 	logger.Log("[OAuth] ✔ ¡Dispositivo vinculado y guardado con éxito para %s (%s)!", phone, provider)
 	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok", "provider": provider})
+}
+
+func (s *Server) handleUnlink(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Phone string `json:"phone"`
+	}
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
+	phone := config.SanitizePhone(body.Phone)
+
+	s.jobManager.StopJob()
+	_ = config.DeleteAccountConfig(phone)
+	s.client.SetConfig(config.AccountConfig{})
+
+	logger.Log("[Account] 🗑️ Dispositivo desvinculado y credenciales eliminadas para %s.", phone)
+	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok"})
 }
 
 func (s *Server) handleTestTelegram(w http.ResponseWriter, r *http.Request) {
@@ -434,7 +546,9 @@ func (s *Server) handleTestTelegram(w http.ResponseWriter, r *http.Request) {
 		BotToken string `json:"bot_token"`
 		ChatID   string `json:"chat_id"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
 
 	botToken := strings.TrimSpace(body.BotToken)
 	chatID := strings.TrimSpace(body.ChatID)
@@ -456,8 +570,8 @@ func (s *Server) handleTestTelegram(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.jobManager.GetNotifier().UpdateCredentials(botToken, chatID)
-	if err := s.jobManager.GetNotifier().SendTestAlert(cfg.Provider); err != nil {
+	tempNotifier := notifier.NewTelegramNotifier(botToken, chatID)
+	if err := tempNotifier.SendTestAlert(cfg.Provider); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]interface{}{
 			"status":  "error",
 			"message": err.Error(),
@@ -474,7 +588,9 @@ func (s *Server) handleSaveTelegram(w http.ResponseWriter, r *http.Request) {
 		BotToken string `json:"bot_token"`
 		ChatID   string `json:"chat_id"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
 
 	phone := config.SanitizePhone(body.Phone)
 	if phone == "" {
@@ -486,43 +602,25 @@ func (s *Server) handleSaveTelegram(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := config.LoadAccountConfig(phone)
-	cfg.TelegramBotToken = strings.TrimSpace(body.BotToken)
-	cfg.TelegramChatID = strings.TrimSpace(body.ChatID)
+	newToken := strings.TrimSpace(body.BotToken)
+	newChatID := strings.TrimSpace(body.ChatID)
+
+	if newToken != "" {
+		cfg.TelegramBotToken = newToken
+	}
+	if newChatID != "" {
+		cfg.TelegramChatID = newChatID
+	}
 
 	if err := config.SaveAccountConfig(cfg); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]interface{}{
 			"status":  "error",
-			"message": err.Error(),
+			"message": "Error al guardar configuración: " + err.Error(),
 		})
 		return
 	}
 
 	s.client.SetConfig(cfg)
-	s.jobManager.GetNotifier().UpdateCredentials(cfg.TelegramBotToken, cfg.TelegramChatID)
-
 	logger.Log("[Telegram] ⚙️ Credenciales de Telegram actualizadas para %s.", phone)
-	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok"})
-}
-
-func (s *Server) handleUnlink(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		jsonResponse(w, http.StatusMethodNotAllowed, map[string]interface{}{"status": "error", "message": "Método no permitido"})
-		return
-	}
-
-	var body struct {
-		Phone string `json:"phone"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	phone := config.SanitizePhone(body.Phone)
-	if phone == "" {
-		phone = s.client.GetConfig().Phone
-	}
-
-	_ = config.DeleteAccountConfig(phone)
-	s.client.SetConfig(config.AccountConfig{})
-	s.jobManager.StopJob()
-
-	logger.Log("[OAuth] 🗑️ Dispositivo desvinculado y credenciales eliminadas por el usuario.")
 	jsonResponse(w, http.StatusOK, map[string]interface{}{"status": "ok"})
 }

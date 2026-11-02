@@ -57,6 +57,9 @@ func OpenCache(dbPath string) (*UploadCache, error) {
 func (c *UploadCache) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.db == nil {
+		return errors.New("database is closed")
+	}
 	if c.db != nil {
 		_, _ = c.db.Exec("PRAGMA wal_checkpoint(PASSIVE);")
 		err := c.db.Close()
@@ -69,6 +72,9 @@ func (c *UploadCache) Close() error {
 func (c *UploadCache) createTables() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.db == nil {
+		return errors.New("database is closed")
+	}
 
 	schema := `
 	CREATE TABLE IF NOT EXISTS uploaded_files (
@@ -143,6 +149,10 @@ func (c *UploadCache) IsUploaded(filePath string, checkChecksum bool) bool {
 
 	// 1. Fast indexed check under read lock
 	c.mu.RLock()
+	if c.db == nil {
+		c.mu.RUnlock()
+		return false
+	}
 	var dummyID int64
 	row := c.db.QueryRow("SELECT id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND status = 'ok' LIMIT 1", relPath, size)
 	if err := row.Scan(&dummyID); err == nil {
@@ -162,6 +172,10 @@ func (c *UploadCache) IsUploaded(filePath string, checkChecksum bool) bool {
 		fileMD5, err := CalculateFileMD5(filePath)
 		if err == nil && fileMD5 != "" {
 			c.mu.RLock()
+			if c.db == nil {
+				c.mu.RUnlock()
+				return false
+			}
 			row = c.db.QueryRow("SELECT id FROM uploaded_files WHERE checksum = ? AND status = 'ok' LIMIT 1", fileMD5)
 			if err := row.Scan(&dummyID); err == nil {
 				c.mu.RUnlock()
@@ -175,28 +189,36 @@ func (c *UploadCache) IsUploaded(filePath string, checkChecksum bool) bool {
 }
 
 func (c *UploadCache) GetCloudID(filePath string) *int64 {
-	fi, err := os.Stat(filePath)
-	if err != nil {
-		return nil
-	}
-	size := fi.Size()
-	name := fi.Name()
-	relPath := filePath
-
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.db == nil {
+		return nil
+	}
+
+	fi, err := os.Stat(filePath)
+	name := ""
+	if err == nil {
+		name = fi.Name()
+	} else {
+		name = filepath.Base(filePath)
+	}
+	relPath := filePath
 
 	var cid sql.NullInt64
-	row := c.db.QueryRow("SELECT cloud_id FROM uploaded_files WHERE file_path = ? AND file_size = ? AND cloud_id IS NOT NULL LIMIT 1", relPath, size)
+	// Match by full path first (most accurate for in-place overwrite of modified files)
+	row := c.db.QueryRow("SELECT cloud_id FROM uploaded_files WHERE file_path = ? AND cloud_id IS NOT NULL AND cloud_id > 0 ORDER BY id DESC LIMIT 1", relPath)
 	if err := row.Scan(&cid); err == nil && cid.Valid && cid.Int64 > 0 {
 		val := cid.Int64
 		return &val
 	}
 
-	row = c.db.QueryRow("SELECT cloud_id FROM uploaded_files WHERE file_name = ? AND file_size = ? AND cloud_id IS NOT NULL LIMIT 1", name, size)
-	if err := row.Scan(&cid); err == nil && cid.Valid && cid.Int64 > 0 {
-		val := cid.Int64
-		return &val
+	// Fallback match by filename
+	if name != "" {
+		row = c.db.QueryRow("SELECT cloud_id FROM uploaded_files WHERE file_name = ? AND cloud_id IS NOT NULL AND cloud_id > 0 ORDER BY id DESC LIMIT 1", name)
+		if err := row.Scan(&cid); err == nil && cid.Valid && cid.Int64 > 0 {
+			val := cid.Int64
+			return &val
+		}
 	}
 
 	return nil
@@ -215,6 +237,12 @@ func (c *UploadCache) MarkUploaded(filePath string, cloudID *int64, status strin
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.db == nil {
+		return errors.New("database is closed")
+	}
+	if c.db == nil {
+		return errors.New("database is closed")
+	}
 
 	query := `
 	INSERT INTO uploaded_files (file_path, file_name, file_size, mtime, cloud_id, uploaded_at, status, checksum)
@@ -242,6 +270,9 @@ func (c *UploadCache) ImportCloudItems(items []CloudItemInfo) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.db == nil {
+		return errors.New("database is closed")
+	}
 
 	tx, err := c.db.Begin()
 	if err != nil {

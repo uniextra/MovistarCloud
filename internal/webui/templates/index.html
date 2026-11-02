@@ -834,7 +834,13 @@
                     data.folders.forEach(f => {
                         const row = document.createElement("div");
                         row.className = "flex items-center justify-between p-2 hover:bg-slate-800 rounded-lg cursor-pointer transition text-slate-300";
-                        row.innerHTML = `<span>📁 ${f.name}</span><span class="text-slate-500 text-[10px]">Entrar →</span>`;
+                        const spanName = document.createElement("span");
+                        spanName.textContent = "📁 " + f.name;
+                        const spanEnter = document.createElement("span");
+                        spanEnter.className = "text-slate-500 text-[10px]";
+                        spanEnter.textContent = "Entrar →";
+                        row.appendChild(spanName);
+                        row.appendChild(spanEnter);
                         row.onclick = () => loadBrowserPath(f.path);
                         listDiv.appendChild(row);
                     });
@@ -918,14 +924,19 @@
                     // Update logs
                     if (data.logs) {
                         const box = document.getElementById("log-box");
-                        box.innerHTML = data.logs.map(line => {
+                        const frag = document.createDocumentFragment();
+                        data.logs.forEach(line => {
                             let color = "text-slate-300";
                             if (line.includes("[OK]")) color = "text-emerald-400";
                             else if (line.includes("[SKIP]")) color = "text-amber-300";
                             else if (line.includes("[ERROR]") || line.includes("❌")) color = "text-rose-400 font-semibold";
                             else if (line.includes("[UPLOAD]")) color = "text-blue-300";
-                            return `<div class="${color} break-all">${line}</div>`;
-                        }).join("");
+                            const lineDiv = document.createElement("div");
+                            lineDiv.className = color + " break-all";
+                            lineDiv.textContent = line;
+                            frag.appendChild(lineDiv);
+                        });
+                        box.replaceChildren(frag);
 
                         if (document.getElementById("autoscroll-toggle").checked) {
                             box.scrollTop = box.scrollHeight;
@@ -943,7 +954,7 @@
                         const pct = s.percent ? s.percent.toFixed(1) : "0.0";
                         document.getElementById("progress-percent-text").textContent = pct + "%";
                         document.getElementById("progress-bar-fill").style.width = pct + "%";
-                        document.getElementById("current-file-text").innerHTML = s.current_file ? `Archivo: <span class="text-slate-200">${s.current_file}</span>` : 'Archivo: <span class="text-slate-400">-</span>';
+                        const curFileEl = document.getElementById("current-file-text"); if (curFileEl) { curFileEl.textContent = s.current_file ? "Archivo: " + s.current_file : "Archivo: -"; }
 
                         // Badge & buttons
                         const badge = document.getElementById("status-badge");
