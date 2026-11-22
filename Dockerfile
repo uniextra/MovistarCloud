@@ -1,11 +1,14 @@
 # Stage 1: Build binary with Go
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY . .
 
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /movistar-uploader ./cmd/uploader
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /movistar-uploader ./cmd/uploader
 
 # Stage 2: Minimal final runtime image (~22 MB)
 FROM alpine:3.21
