@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
-	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -48,45 +46,58 @@ type Client struct {
 	baseURL          string
 	uploadURL        string
 	httpClient       *http.Client
-	cookieJar        *cookiejar.Jar
 	mu               sync.RWMutex
 	refreshMu        sync.Mutex
+	lastRefreshTime  time.Time
 	OnSessionExpired func(err error)
+
+	waf       wafBreaker
+	wafUpload wafBreaker
+
+	sapiSem        chan struct{}
+	pacingInterval time.Duration
+	pacingMu       sync.Mutex
+	lastReqTime    time.Time
+
+	loginFailures     int
+	loginFailingSince time.Time
+	loginRetryAt      time.Time
+	refreshTransient  bool
 }
 
 func NewClient(cfg config.AccountConfig) *Client {
-	jar, _ := cookiejar.New(nil)
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
+	transport := auth.NewFingerprintedTransport()
 
 	httpClient := &http.Client{
-		Jar:       jar,
 		Transport: transport,
-		Timeout:   0, // No global timeout to allow huge file uploads
+		Timeout:   0, // Sin timeout global para permitir transferencias de ficheros grandes
+		Jar:       nil,
 	}
 
-	baseURL := "https://micloud.movistar.es"
-	uploadURL := "https://upload.micloud.movistar.es"
-	if strings.EqualFold(cfg.Provider, "o2") {
-		baseURL = "https://cloud.o2online.es"
-		uploadURL = "https://upload.cloud.o2online.es"
+	baseURL := auth.GetSAPIBaseURL(cfg.Provider)
+	uploadURL := auth.GetUploadBaseURL(cfg.Provider)
+
+	maxConcurrent := 3
+	if v := strings.TrimSpace(os.Getenv("SAPI_MAX_CONCURRENT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxConcurrent = n
+		}
+	}
+
+	pacingMs := 50
+	if v := strings.TrimSpace(os.Getenv("SAPI_PACING_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			pacingMs = n
+		}
 	}
 
 	return &Client{
-		cfg:        cfg,
-		baseURL:    baseURL,
-		uploadURL:  uploadURL,
-		httpClient: httpClient,
-		cookieJar:  jar,
+		cfg:            cfg,
+		baseURL:        baseURL,
+		uploadURL:      uploadURL,
+		httpClient:     httpClient,
+		sapiSem:        make(chan struct{}, maxConcurrent),
+		pacingInterval: time.Duration(pacingMs) * time.Millisecond,
 	}
 }
 
@@ -94,13 +105,12 @@ func (c *Client) SetConfig(cfg config.AccountConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cfg = cfg
-	if strings.EqualFold(cfg.Provider, "o2") {
-		c.baseURL = "https://cloud.o2online.es"
-		c.uploadURL = "https://upload.cloud.o2online.es"
-	} else {
-		c.baseURL = "https://micloud.movistar.es"
-		c.uploadURL = "https://upload.micloud.movistar.es"
-	}
+	c.baseURL = auth.GetSAPIBaseURL(cfg.Provider)
+	c.uploadURL = auth.GetUploadBaseURL(cfg.Provider)
+	c.loginFailures = 0
+	c.loginFailingSince = time.Time{}
+	c.loginRetryAt = time.Time{}
+	c.refreshTransient = false
 }
 
 func (c *Client) GetConfig() config.AccountConfig {
@@ -115,47 +125,121 @@ func (c *Client) HasCredentials() bool {
 	return c.cfg.RefreshToken != "" || c.cfg.AccessToken != "" || (c.cfg.JSessionID != "" && c.cfg.ValidationKey != "")
 }
 
-func (c *Client) appendValidationKey(u string) string {
+func (c *Client) paceRequest() {
+	c.pacingMu.Lock()
+	defer c.pacingMu.Unlock()
+	if c.pacingInterval <= 0 {
+		return
+	}
+	now := time.Now()
+	if !c.lastReqTime.IsZero() {
+		elapsed := now.Sub(c.lastReqTime)
+		if elapsed < c.pacingInterval {
+			time.Sleep(c.pacingInterval - elapsed)
+			now = time.Now()
+		}
+	}
+	c.lastReqTime = now
+}
+
+func (c *Client) acquireSlot() {
+	if c.sapiSem != nil {
+		c.sapiSem <- struct{}{}
+	}
+	c.paceRequest()
+}
+
+func (c *Client) releaseSlot() {
+	if c.sapiSem != nil {
+		<-c.sapiSem
+	}
+}
+
+func (c *Client) appendValidationKey(rawURL string) string {
 	c.mu.RLock()
 	vk := c.cfg.ValidationKey
 	c.mu.RUnlock()
 
 	if vk == "" {
-		return u
+		return rawURL
 	}
 
-	sep := "?"
-	if strings.Contains(u, "?") {
-		sep = "&"
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
 	}
-	if !strings.Contains(u, "validationkey=") {
-		return fmt.Sprintf("%s%svalidationkey=%s", u, sep, url.QueryEscape(vk))
+	if strings.HasSuffix(parsed.Path, "/system/information") && auth.IsDesktopProfile() {
+		return rawURL
 	}
-	return u
+	if parsed.Query().Has("validationkey") {
+		return rawURL
+	}
+	if parsed.RawQuery == "" {
+		parsed.RawQuery = "validationkey=" + url.QueryEscape(vk)
+	} else {
+		parsed.RawQuery += "&validationkey=" + url.QueryEscape(vk)
+	}
+	return parsed.String()
 }
 
-func (c *Client) processSAPIResponse(resp *http.Response) {
-	if resp == nil || resp.StatusCode >= 400 {
-		return
+func (c *Client) replaceValidationKey(rawURL string) string {
+	c.mu.RLock()
+	vk := c.cfg.ValidationKey
+	c.mu.RUnlock()
+	parsed, err := url.Parse(rawURL)
+	if vk == "" || err != nil {
+		return rawURL
+	}
+	q := parsed.Query()
+	q.Set("validationkey", vk)
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+func sessionCookieHeader(jsessionID, validationKey string) string {
+	var parts []string
+	if jsessionID != "" {
+		parts = append(parts, "JSESSIONID="+jsessionID)
+	}
+	if validationKey != "" && (!auth.IsDesktopProfile() || jsessionID == "") {
+		parts = append(parts, "validationKey="+validationKey)
+		parts = append(parts, "validationkey="+validationKey)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (c *Client) processSAPIResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
 	}
 
-	c.mu.Lock()
-	changed := false
+	isUploadHost := resp.Request != nil && resp.Request.URL != nil &&
+		strings.HasPrefix(strings.ToLower(resp.Request.URL.Hostname()), "upload.")
 
-	// 1. Check for rotated OAuth authorization header
+	var changed bool
+	var tokensRotated bool
+	c.mu.Lock()
+
+	// 1. Cabecera Authorization devuelta con tokens rotados (incluso en 401)
 	if authResp := resp.Header.Get("Authorization"); authResp != "" {
 		if rotated := auth.ParseOAuthResponseHeader(authResp); rotated != nil {
 			if rotated.AccessToken != "" && rotated.AccessToken != c.cfg.AccessToken {
 				c.cfg.AccessToken = rotated.AccessToken
 				changed = true
+				tokensRotated = true
 			}
 			if rotated.RefreshToken != "" && rotated.RefreshToken != c.cfg.RefreshToken {
 				c.cfg.RefreshToken = rotated.RefreshToken
 				changed = true
+				tokensRotated = true
 			}
 			if rotated.LastRefreshDate > 0 && rotated.LastRefreshDate != c.cfg.LastRefreshDate {
 				c.cfg.LastRefreshDate = rotated.LastRefreshDate
 				changed = true
+			} else if rotated.LastRefreshDate <= 0 && rotated.AccessToken != "" && resp.StatusCode < 400 && auth.IsDesktopProfile() {
+				c.cfg.LastRefreshDate = time.Now().UnixMilli()
+				changed = true
+				tokensRotated = true
 			}
 			if rotated.ExpiresIn != "" && rotated.ExpiresIn != c.cfg.ExpiresIn {
 				c.cfg.ExpiresIn = rotated.ExpiresIn
@@ -164,14 +248,16 @@ func (c *Client) processSAPIResponse(resp *http.Response) {
 		}
 	}
 
-	// 2. Session cookies
-	for _, cookie := range resp.Cookies() {
-		if strings.EqualFold(cookie.Name, "validationkey") && cookie.Value != "" && cookie.Value != c.cfg.ValidationKey {
-			c.cfg.ValidationKey = cookie.Value
-			changed = true
-		} else if strings.EqualFold(cookie.Name, "JSESSIONID") && cookie.Value != "" && cookie.Value != c.cfg.JSessionID {
-			c.cfg.JSessionID = cookie.Value
-			changed = true
+	// 2. Cookies de sesión (solo con código < 400 para no capturar cookies anónimas de HTMLs de error)
+	if resp.StatusCode < 400 {
+		for _, cookie := range resp.Cookies() {
+			if strings.EqualFold(cookie.Name, "validationkey") && cookie.Value != "" && cookie.Value != c.cfg.ValidationKey {
+				c.cfg.ValidationKey = cookie.Value
+				changed = true
+			} else if strings.EqualFold(cookie.Name, "JSESSIONID") && cookie.Value != "" && cookie.Value != c.cfg.JSessionID && !(isUploadHost && c.cfg.JSessionID != "") {
+				c.cfg.JSessionID = cookie.Value
+				changed = true
+			}
 		}
 	}
 
@@ -182,6 +268,39 @@ func (c *Client) processSAPIResponse(resp *http.Response) {
 		_ = config.SaveAccountConfig(cfgCopy)
 		logger.Log("[OAuth] ✔ Nuevas credenciales/cookies capturadas y guardadas.")
 	}
+	return changed || tokensRotated
+}
+
+func (c *Client) retryRequestWithCurrentConfig(req *http.Request) (*http.Response, error) {
+	cfg := c.GetConfig()
+	var retryBody io.Reader
+	if req.GetBody != nil {
+		body, err := req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		retryBody = body
+	}
+	newReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), retryBody)
+	if err != nil {
+		return nil, err
+	}
+	newReq.Header = req.Header.Clone()
+	newReq.Header.Del("Authorization")
+	newReq.Header.Del("Cookie")
+	if cfg.AccessToken != "" {
+		newReq.Header.Set("Authorization", auth.BuildOAuthHeader(cfg.AccessToken, cfg.RefreshToken, cfg.LastRefreshDate, cfg.ExpiresIn))
+	}
+	if cfg.JSessionID != "" || cfg.ValidationKey != "" {
+		newReq.Header.Set("Cookie", sessionCookieHeader(cfg.JSessionID, cfg.ValidationKey))
+	}
+	newReq.URL, _ = url.Parse(c.replaceValidationKey(newReq.URL.String()))
+	resp, err := c.httpClient.Do(newReq)
+	if err != nil {
+		return nil, err
+	}
+	c.processSAPIResponse(resp)
+	return resp, nil
 }
 
 func (c *Client) RefreshSession() bool {
@@ -190,20 +309,47 @@ func (c *Client) RefreshSession() bool {
 
 	c.mu.RLock()
 	cfg := c.cfg
+	lastRef := c.lastRefreshTime
 	c.mu.RUnlock()
 
 	if cfg.AccessToken == "" && cfg.RefreshToken == "" {
 		return false
 	}
 
-	logger.Log("[OAuth] 🔄 Renovando sesión SAPI...")
+	// Protección contra RTR (Refresh Token Rotation): deduplicación si se refrescó hace < 30s
+	if !lastRef.IsZero() && time.Since(lastRef) < 30*time.Second {
+		return true
+	}
 
-	// 1. Primary attempt: SAPILoginOAuth with current access_token
+	// Respetar espera por fallo previo en perfil desktop
+	if auth.IsDesktopProfile() {
+		c.mu.RLock()
+		retryAt := c.loginRetryAt
+		c.mu.RUnlock()
+		if time.Now().Before(retryAt) {
+			c.mu.Lock()
+			c.refreshTransient = true
+			c.mu.Unlock()
+			return false
+		}
+	}
+
+	logger.Log("[OAuth] 🔄 Renovando sesión SAPI...")
+	c.mu.Lock()
+	c.refreshTransient = false
+	c.mu.Unlock()
+
 	sapiBase := auth.GetSAPIBaseURL(cfg.Provider)
+
+	// 1. Intento primario: SAPILoginOAuth con access_token actual
 	if cfg.AccessToken != "" {
 		res := auth.SAPILoginOAuth(c.httpClient, sapiBase, cfg.AccessToken, cfg.RefreshToken, cfg.DeviceID, cfg.DeviceName, cfg.LastRefreshDate, cfg.ExpiresIn)
-		if res.StatusCode == http.StatusOK && (res.ValidationKey != "" || res.JSessionID != "") {
+		if res.StatusCode == http.StatusOK && (res.ValidationKey != "" || res.JSessionID != "" || res.RefreshedOAuth != nil) {
 			c.mu.Lock()
+			c.loginFailures = 0
+			c.loginFailingSince = time.Time{}
+			c.loginRetryAt = time.Time{}
+			c.lastRefreshTime = time.Now()
 			if res.ValidationKey != "" {
 				c.cfg.ValidationKey = res.ValidationKey
 			}
@@ -229,12 +375,21 @@ func (c *Client) RefreshSession() bool {
 			}
 			logger.Log("[OAuth] ✔ Sesión SAPI refrescada exitosamente.")
 			return true
+		} else {
+			if auth.IsDesktopProfile() {
+				if !c.desktopLoginFailed(&res) {
+					if c.OnSessionExpired != nil {
+						go c.OnSessionExpired(errors.New("sesión expirada de forma definitiva"))
+					}
+					return false
+				}
+			}
 		}
 	}
 
-	// 2. Fallback: exchange refresh_token with Telefonica OAuth
+	// 2. Fallback: Canje en apiseg.telefonica.es con refresh_token
 	if cfg.RefreshToken != "" {
-		logger.Log("[OAuth] 🔄 Access token expirado. Canjeando refresh_token en apiseg.telefonica.es (%s)...", cfg.Provider)
+		logger.Log("[OAuth] 🔄 Access token expirado. Canjeando refresh_token en apiseg (%s)...", cfg.Provider)
 		tokens, err := auth.RefreshOAuthToken(cfg.RefreshToken, cfg.Provider)
 		if err == nil && tokens != nil && tokens.AccessToken != "" {
 			c.mu.Lock()
@@ -243,16 +398,19 @@ func (c *Client) RefreshSession() bool {
 				c.cfg.RefreshToken = tokens.RefreshToken
 			}
 			c.cfg.LastRefreshDate = time.Now().UnixMilli()
+			c.lastRefreshTime = time.Now()
 			cfgCopy := c.cfg
 			c.mu.Unlock()
 
-			// Persistir inmediatamente los nuevos tokens para proteger contra RTR (Refresh Token Rotation)
 			_ = config.SaveAccountConfig(cfgCopy)
 
 			// Con nuevo access_token, inicializar SAPI
 			res := auth.SAPILoginOAuth(c.httpClient, sapiBase, tokens.AccessToken, cfgCopy.RefreshToken, cfgCopy.DeviceID, cfgCopy.DeviceName, cfgCopy.LastRefreshDate, cfgCopy.ExpiresIn)
 			if res.StatusCode == http.StatusOK {
 				c.mu.Lock()
+				c.loginFailures = 0
+				c.loginFailingSince = time.Time{}
+				c.loginRetryAt = time.Time{}
 				if res.ValidationKey != "" {
 					c.cfg.ValidationKey = res.ValidationKey
 				}
@@ -278,61 +436,148 @@ func (c *Client) RefreshSession() bool {
 				}
 				logger.Log("[OAuth] ✔ Tokens renovados y sesión SAPI inicializada con éxito.")
 				return true
-			} else {
-				logger.Log("[OAuth] ⚠️ Inicialización SAPI devolvió HTTP %d tras refresco: %v", res.StatusCode, res.Error)
 			}
 		} else if err != nil {
 			logger.Log("[OAuth] ❌ Error canjeando refresh_token: %v", err)
 		}
 	}
 
-	logger.Log("[!] ⚠️ ERROR 401: No se pudo renovar la sesión automáticamente. Requiere revinculación en el panel web.")
-	if c.OnSessionExpired != nil {
-		go c.OnSessionExpired(errors.New("sesión expirada (HTTP 401)"))
-	}
+	logger.Log("[!] ⚠️ Fallo al renovar sesión SAPI.")
 	return false
 }
 
 func (c *Client) DoRequest(req *http.Request) (*http.Response, error) {
+	freno, que, quien := c.breakerFor(req)
+	if until := freno.blockedUntil(); !until.IsZero() {
+		return nil, wafBlockedError(until, req.Method, req.URL.Path)
+	}
+
+	// Las subidas al host de subidas tienen su propio flujo y no ocupan el slot de la API SAPI
+	if freno == &c.wafUpload {
+		c.paceRequest()
+	} else {
+		c.acquireSlot()
+		defer c.releaseSlot()
+	}
+
+	if until := freno.blockedUntil(); !until.IsZero() {
+		return nil, wafBlockedError(until, req.Method, req.URL.Path)
+	}
+
+	resp, err := c.doRequestLocked(req)
+	if err == nil && resp != nil {
+		if isWAFBlockResponse(resp) {
+			freno.trip(que)
+		} else if resp.StatusCode < 500 {
+			freno.ok(quien)
+		}
+	}
+	return resp, err
+}
+
+func (c *Client) doRequestLocked(req *http.Request) (*http.Response, error) {
 	c.mu.RLock()
 	cfg := c.cfg
 	c.mu.RUnlock()
 
-	req.Header.Set("User-Agent", auth.DesktopUserAgent)
+	desktop := auth.IsDesktopProfile()
+	req.Header.Set("User-Agent", auth.GetDesktopUserAgent())
 	if req.Header.Get("Accept") == "" {
-		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Accept", "*/*")
 	}
+
+	if desktop {
+		if req.Header.Get("Accept-Language") == "" {
+			req.Header.Set("Accept-Language", auth.DesktopAcceptLanguage)
+		}
+		if req.Header.Get("x-request-id") == "" {
+			req.Header.Set("x-request-id", auth.NewRequestID())
+		}
+		if req.Header.Get("Connection") == "" {
+			req.Header.Set("Connection", "Keep-Alive")
+		}
+	} else {
+		if req.Header.Get("Accept-Language") == "" {
+			req.Header.Set("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
+		}
+		if req.Header.Get("X-Requested-With") == "" {
+			req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		}
+	}
+
 	if cfg.DeviceID != "" {
-		req.Header.Set("X-deviceid", cfg.DeviceID)
-	}
-	if cfg.DeviceName != "" {
-		req.Header.Set("X-devicename", cfg.DeviceName)
+		req.Header.Set("X-deviceid", auth.SanitizeDeviceID(cfg.DeviceID))
 	}
 	if cfg.AccessToken != "" {
 		req.Header.Set("Authorization", auth.BuildOAuthHeader(cfg.AccessToken, cfg.RefreshToken, cfg.LastRefreshDate, cfg.ExpiresIn))
+	}
+	if req.Header.Get("Cookie") == "" && (cfg.ValidationKey != "" || cfg.JSessionID != "") {
+		req.Header.Set("Cookie", sessionCookieHeader(cfg.JSessionID, cfg.ValidationKey))
 	}
 
 	req.URL, _ = url.Parse(c.appendValidationKey(req.URL.String()))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Err != nil {
+			return nil, fmt.Errorf("SAPI request failed (%s %s): %w", req.Method, req.URL.Path, urlErr.Err)
+		}
 		return nil, err
 	}
 
-	c.processSAPIResponse(resp)
+	credentialsRotated := c.processSAPIResponse(resp)
+
+	// Si SAPI responde 401 pero incluye cabecera Authorization rotada, reintentamos inmediatamente
+	if resp.StatusCode == http.StatusUnauthorized && credentialsRotated && (req.Body == nil || req.GetBody != nil) {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		return c.retryRequestWithCurrentConfig(req)
+	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		// Cannot retry if body cannot be rewinded
 		if req.Body != nil && req.GetBody == nil {
+			// Streaming upload: renovar sesión para el siguiente reintento del uploader
+			if !credentialsRotated && c.HasCredentials() {
+				c.RefreshSession()
+			}
 			return resp, nil
 		}
-		origBody, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
 
-		if c.HasCredentials() && c.RefreshSession() {
-			c.mu.RLock()
-			newCfg := c.cfg
-			c.mu.RUnlock()
+		if c.HasCredentials() {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+
+			if c.RefreshSession() {
+				resp2, err2 := c.retryRequestWithCurrentConfig(req)
+				if err2 == nil && resp2 != nil {
+					return resp2, nil
+				}
+				if err2 != nil {
+					return resp2, err2
+				}
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+	}
+
+	// Retroceso suave ante 429, 503 o 408
+	if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusRequestTimeout) &&
+		(req.Body == nil || req.GetBody != nil) {
+		const maxBackoffRetries = 4
+		for retry := 1; retry <= maxBackoffRetries; retry++ {
+			backoff := time.Duration(1<<(retry-1)) * time.Second
+			if backoff > 8*time.Second {
+				backoff = 8 * time.Second
+			}
+			jitter := time.Duration((time.Now().UnixNano()%400)+100) * time.Millisecond
+			sleepDur := backoff + jitter
+			if resp.StatusCode == http.StatusRequestTimeout {
+				c.httpClient.CloseIdleConnections()
+			}
+			logger.Log("[SAPI] ⏳ Rate limit o servicio ocupado (%s %s HTTP %d). Reintentando en %v (%d/%d)...", req.Method, req.URL.Path, resp.StatusCode, sleepDur, retry, maxBackoffRetries)
+			_ = resp.Body.Close()
+			time.Sleep(sleepDur)
 
 			var retryBody io.Reader
 			if req.GetBody != nil {
@@ -342,25 +587,21 @@ func (c *Client) DoRequest(req *http.Request) (*http.Response, error) {
 				}
 				retryBody = rb
 			}
-
 			newReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), retryBody)
 			if err != nil {
 				return nil, err
 			}
 			newReq.Header = req.Header.Clone()
-			newReq.Header.Set("Authorization", auth.BuildOAuthHeader(newCfg.AccessToken, newCfg.RefreshToken, newCfg.LastRefreshDate, newCfg.ExpiresIn))
-			newReq.URL, _ = url.Parse(c.appendValidationKey(newReq.URL.String()))
-
-			resp2, err2 := c.httpClient.Do(newReq)
-			if err2 == nil {
-				c.processSAPIResponse(resp2)
-				return resp2, nil
+			respRetry, errRetry := c.httpClient.Do(newReq)
+			if errRetry != nil {
+				return nil, errRetry
 			}
-			return resp2, err2
+			c.processSAPIResponse(respRetry)
+			if respRetry.StatusCode != http.StatusTooManyRequests && respRetry.StatusCode != http.StatusServiceUnavailable {
+				return respRetry, nil
+			}
+			resp = respRetry
 		}
-
-		resp.Body = io.NopCloser(bytes.NewReader(origBody))
-		return resp, nil
 	}
 
 	return resp, nil
@@ -435,7 +676,6 @@ func (c *Client) GetStorageSpace() (*StorageSpace, error) {
 	return res, nil
 }
 
-// GetGalleryInventory fetches all existing media items in Movistar Cloud to populate duplicate prevention cache.
 func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 	logger.Log("[SAPI] Obteniendo inventario de la Galería en Movistar Cloud para control de duplicados...")
 
@@ -446,7 +686,7 @@ func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Strategy 1: Timeline (/sapi/media/timeline?action=get)
+	// Estrategia 1: Timeline (/sapi/media/timeline?action=get)
 	timelineURL := fmt.Sprintf("%s/sapi/media/timeline?action=get", baseURL)
 	timelineBody := []byte(`{"data":{"granularity":"daily","sortorder":"creationdate"}}`)
 
@@ -489,7 +729,6 @@ func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 						}
 					}
 
-					// If section.IDs were returned instead of full objects, fetch in chunks of 50
 					if len(pendingIDs) > 0 {
 						for i := 0; i < len(pendingIDs); i += 50 {
 							end := i + 50
@@ -543,7 +782,7 @@ func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 		}
 	}
 
-	// Strategy 2: /sapi/media?action=get&limit=5000
+	// Estrategia 2: /sapi/media?action=get&limit=5000
 	mediaURL := fmt.Sprintf("%s/sapi/media?action=get&limit=5000", baseURL)
 	mediaBody := []byte(`{"data":{"fields":["name","size","folder","origin"]}}`)
 	req2, err := http.NewRequestWithContext(ctx, "POST", mediaURL, bytes.NewReader(mediaBody))
@@ -553,29 +792,29 @@ func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 		if err == nil {
 			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-			defer resp.Body.Close()
-			var mRoot struct {
-				Data struct {
-					Media []struct {
-						ID   interface{} `json:"id"`
-						Name string      `json:"name"`
-						Size interface{} `json:"size"`
-					} `json:"media"`
-				} `json:"data"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&mRoot); err == nil {
-				var items []CloudItem
-				for _, m := range mRoot.Data.Media {
-					name := m.Name
-					size := parseFlexibleInt(m.Size)
-					id := parseFlexibleInt(m.ID)
-					if name != "" && size > 0 {
-						items = append(items, CloudItem{ID: id, Name: name, Size: size})
-					}
+				var mRoot struct {
+					Data struct {
+						Media []struct {
+							ID   interface{} `json:"id"`
+							Name string      `json:"name"`
+							Size interface{} `json:"size"`
+						} `json:"media"`
+					} `json:"data"`
 				}
-				if len(items) > 0 {
-					logger.Log("[SAPI] ✔ Inventario en la nube cargado vía /sapi/media: %d elementos.", len(items))
-					return items, nil
+				if err := json.NewDecoder(resp.Body).Decode(&mRoot); err == nil {
+					var items []CloudItem
+					for _, m := range mRoot.Data.Media {
+						name := m.Name
+						size := parseFlexibleInt(m.Size)
+						id := parseFlexibleInt(m.ID)
+						if name != "" && size > 0 {
+							items = append(items, CloudItem{ID: id, Name: name, Size: size})
+						}
+					}
+					if len(items) > 0 {
+						logger.Log("[SAPI] ✔ Inventario en la nube cargado vía /sapi/media: %d elementos.", len(items))
+						return items, nil
+					}
 				}
 			}
 		}
@@ -585,10 +824,8 @@ func (c *Client) GetGalleryInventory() ([]CloudItem, error) {
 	return nil, nil
 }
 
-// UploadToGallery uploads a media file straight into the Gallery timeline.
-// CRITICAL: We deliberately omit 'folderid' to inject directly into the user's Gallery (not a folder).
-// If existingMediaID is provided (> 0), it is sent in data.id to overwrite in-place without creating a duplicate (1).
-// Automatic retries are performed if Telefónica's asynchronous validation window returns MED-1017.
+// UploadToGallery sube un fichero multimedia a la galería con vigilancia de sockets (stallReader)
+// y reintentos ante 408, 429, 5xx, 401 y validación MED-1017.
 func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTime time.Time, mimeType string, existingMediaID *int64) (CloudUploadResult, error) {
 	fi, err := os.Stat(filePath)
 	if err != nil {
@@ -618,14 +855,31 @@ func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTi
 		return CloudUploadResult{}, err
 	}
 
-	const maxValidationRetries = 14
-	const retryDelay = 1500 * time.Millisecond
+	maxAttempts := config.UploadAttempts()
+	if maxAttempts < 4 {
+		maxAttempts = 4
+	}
 
-	for attempt := 0; attempt <= maxValidationRetries; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
 			return CloudUploadResult{}, ctx.Err()
 		default:
+		}
+
+		if attempt > 0 {
+			wait := time.Duration(1<<attempt) * time.Second
+			if wait > config.UploadRetryMaxWait() {
+				wait = config.UploadRetryMaxWait()
+			}
+			jitter := time.Duration((time.Now().UnixNano()%500)+100) * time.Millisecond
+			sleepTime := wait + jitter
+			logger.Log("[SAPI] ⏳ Reintentando subida de %s en %v (intento %d/%d)...", fileName, sleepTime, attempt+1, maxAttempts)
+			select {
+			case <-ctx.Done():
+				return CloudUploadResult{}, ctx.Err()
+			case <-time.After(sleepTime):
+			}
 		}
 
 		fileHandle, err := os.Open(filePath)
@@ -668,38 +922,90 @@ func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTi
 		c.mu.RUnlock()
 
 		uploadEndpoint := fmt.Sprintf("%s/sapi/upload?action=save&acceptasynchronous=true", upURL)
-		req, err := http.NewRequestWithContext(ctx, "POST", uploadEndpoint, pr)
+
+		reqCtx, reqCancel := context.WithCancel(ctx)
+		// Vigilante de subida parada: si el servidor no lee durante 60s, cancela el contexto del envío
+		watchedBody := newStallReader(pr, 60*time.Second, func() {
+			logger.Log("[SAPI] 🔌 Subida de %s parada: el servidor dejó de recibir datos durante >60s.", fileName)
+			reqCancel()
+		})
+
+		req, err := http.NewRequestWithContext(reqCtx, "POST", uploadEndpoint, watchedBody)
 		if err != nil {
+			watchedBody.stop()
 			_ = pr.Close()
+			reqCancel()
 			return CloudUploadResult{}, err
 		}
 		req.Header.Set("Content-Type", mpw.FormDataContentType())
 
 		resp, err := c.DoRequest(req)
+		stalled := watchedBody.stop()
 		_ = pr.Close()
+		reqCancel()
+
 		if err != nil {
-			return CloudUploadResult{}, err
+			if stalled {
+				c.httpClient.CloseIdleConnections()
+				continue
+			}
+			if reqCtx.Err() != nil && ctx.Err() == nil {
+				// Cancelado por timeout local o watchdog
+				c.httpClient.CloseIdleConnections()
+				continue
+			}
+			// Si el error fue de red/WAF, continuar reintentando
+			logger.Log("[SAPI] ⚠️ Error en subida de %s: %v", fileName, err)
+			continue
 		}
 
-		bodyBytes, err := io.ReadAll(resp.Body)
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		if err != nil {
-			return CloudUploadResult{}, err
+			continue
 		}
 
 		bodyStr := string(bodyBytes)
 
-		// MED-1017 check: Media is being validated asynchronously (typically 4-10 seconds)
-		if strings.Contains(bodyStr, "MED-1017") || strings.Contains(strings.ToLower(bodyStr), "media not validated") {
-			if attempt < maxValidationRetries {
-				logger.Log("[SAPI] ⏳ Servidor validando media asíncronamente (MED-1017). Reintentando en 1.5s (intento %d/%d)...", attempt+1, maxValidationRetries)
-				select {
-				case <-ctx.Done():
-					return CloudUploadResult{}, ctx.Err()
-				case <-time.After(retryDelay):
-					continue
-				}
+		// 1. Manejo de 408 Timeout en subida
+		if resp.StatusCode == http.StatusRequestTimeout {
+			c.httpClient.CloseIdleConnections()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// 2. Manejo de 401 en subida
+		if resp.StatusCode == http.StatusUnauthorized {
+			c.httpClient.CloseIdleConnections()
+			if c.RefreshSession() {
+				time.Sleep(1 * time.Second)
+				continue
 			}
+			return CloudUploadResult{}, fmt.Errorf("upload unauthorized (HTTP 401): %s", bodyStr)
+		}
+
+		// 3. Manejo de 429 Too Many Requests o 5xx
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			c.httpClient.CloseIdleConnections()
+			continue
+		}
+
+		// 4. MED-1017: Media en validación asíncrona
+		if strings.Contains(bodyStr, "MED-1017") || strings.Contains(strings.ToLower(bodyStr), "media not validated") {
+			medWait := 2500*time.Millisecond + time.Duration(attempt)*1500*time.Millisecond
+			logger.Log("[SAPI] ⏳ Servidor validando media asíncronamente (MED-1017). Reintentando en %v (intento %d/%d)...", medWait, attempt+1, maxAttempts)
+			select {
+			case <-ctx.Done():
+				return CloudUploadResult{}, ctx.Err()
+			case <-time.After(medWait):
+				continue
+			}
+		}
+
+		// 5. MED-1048 o PAPI-0000: Error temporal de proceso
+		if strings.Contains(bodyStr, "MED-1048") || strings.Contains(bodyStr, "PAPI-0000") {
+			time.Sleep(3 * time.Second)
+			continue
 		}
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
@@ -726,12 +1032,13 @@ func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTi
 		}
 
 		if res.Error != nil && res.Error.Code != "" {
-			if res.Error.Code == "MED-1017" && attempt < maxValidationRetries {
-				logger.Log("[SAPI] ⏳ Servidor validando media asíncronamente (MED-1017 en error body). Reintentando en 1.5s (intento %d/%d)...", attempt+1, maxValidationRetries)
+			if res.Error.Code == "MED-1017" {
+				medWait := 2500*time.Millisecond + time.Duration(attempt)*1500*time.Millisecond
+				logger.Log("[SAPI] ⏳ Servidor validando media asíncronamente (MED-1017 en error body). Reintentando en %v...", medWait)
 				select {
 				case <-ctx.Done():
 					return CloudUploadResult{}, ctx.Err()
-				case <-time.After(retryDelay):
+				case <-time.After(medWait):
 					continue
 				}
 			}
@@ -764,7 +1071,7 @@ func (c *Client) UploadToGallery(ctx context.Context, filePath string, captureTi
 		}, nil
 	}
 
-	return CloudUploadResult{}, errors.New("subida fallida tras agotar reintentos de validación MED-1017")
+	return CloudUploadResult{}, errors.New("subida fallida tras agotar reintentos")
 }
 
 func parseFlexibleInt(v interface{}) int64 {

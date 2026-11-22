@@ -59,6 +59,14 @@ func Log(format string, args ...interface{}) {
 	DefaultLogger.Append(format, args...)
 }
 
+func GetRecentLogs(maxCount int) []string {
+	lines := DefaultLogger.GetLines()
+	if maxCount > 0 && len(lines) > maxCount {
+		return lines[len(lines)-maxCount:]
+	}
+	return lines
+}
+
 func GetLogs() []string {
 	return DefaultLogger.GetLines()
 }
