@@ -3,9 +3,12 @@ package notifier
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,14 +23,28 @@ type TelegramNotifier struct {
 	mu       sync.Mutex
 
 	lastNotificationAt time.Time
+	lastAlerts         map[string]time.Time
 	lastError          string
 }
 
+var sendRetryDelay = 3 * time.Second
+var apiBase = "https://api.telegram.org"
+
 func NewTelegramNotifier(botToken, chatID string) *TelegramNotifier {
+	token := strings.TrimSpace(botToken)
+	chat := strings.TrimSpace(chatID)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
+	}
+	if chat == "" {
+		chat = strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID"))
+	}
+
 	return &TelegramNotifier{
-		botToken: strings.TrimSpace(botToken),
-		chatID:   strings.TrimSpace(chatID),
-		client:   &http.Client{Timeout: 10 * time.Second},
+		botToken:   token,
+		chatID:     chat,
+		client:     newClient(10 * time.Second),
+		lastAlerts: make(map[string]time.Time),
 	}
 }
 
@@ -38,10 +55,19 @@ func (t *TelegramNotifier) IsConfigured() bool {
 }
 
 func (t *TelegramNotifier) UpdateCredentials(botToken, chatID string) {
+	token := strings.TrimSpace(botToken)
+	chat := strings.TrimSpace(chatID)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
+	}
+	if chat == "" {
+		chat = strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID"))
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.botToken = strings.TrimSpace(botToken)
-	t.chatID = strings.TrimSpace(chatID)
+	t.botToken = token
+	t.chatID = chat
 }
 
 func (t *TelegramNotifier) Status() (bool, string, string) {
@@ -52,6 +78,36 @@ func (t *TelegramNotifier) Status() (bool, string, string) {
 		lastAt = t.lastNotificationAt.Format("2006-01-02 15:04:05")
 	}
 	return t.botToken != "" && t.chatID != "", lastAt, t.lastError
+}
+
+func sanitizeTransportError(err error, token string) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		err = urlErr.Err
+	}
+	msg := err.Error()
+	if token != "" {
+		msg = strings.ReplaceAll(msg, token, maskSecret(token))
+	}
+	return msg
+}
+
+func maskSecret(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	n := len(s)
+	if n <= 6 {
+		return "****"
+	}
+	if n <= 12 {
+		return s[:2] + "****" + s[n-2:]
+	}
+	return s[:4] + "…" + s[n-4:]
 }
 
 func (t *TelegramNotifier) SendMessage(text string) error {
@@ -77,31 +133,43 @@ func (t *TelegramNotifier) SendMessage(text string) error {
 		return err
 	}
 
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return err
+	apiURL := fmt.Sprintf("%s/bot%s/sendMessage", apiBase, token)
+	post := func() (*http.Response, error) {
+		req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return t.client.Do(req)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := t.client.Do(req)
+	resp, err := post()
 	if err != nil {
+		// En fallo de red (conexión caída o rota), se cierran conexiones ociosas y se reintenta tras 3s
+		transport.CloseIdleConnections()
+		time.Sleep(sendRetryDelay)
+		resp, err = post()
+	}
+
+	if err != nil {
+		safeErr := sanitizeTransportError(err, token)
 		t.mu.Lock()
-		t.lastError = fmt.Sprintf("Error de red: %v", err)
+		t.lastError = fmt.Sprintf("Error de red: %s", safeErr)
 		t.mu.Unlock()
-		logger.Log("[Telegram] ❌ Error conectando con Telegram: %v", err)
-		return err
+		logger.Log("[Telegram] ❌ Error conectando con Telegram: %s", safeErr)
+		return fmt.Errorf("error de red contactando con Telegram: %s", safeErr)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(resp.Body)
-		errMsg := fmt.Sprintf("Telegram respondió HTTP %d: %s", resp.StatusCode, string(respBody))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		safeBody := strings.ReplaceAll(string(respBody), token, maskSecret(token))
+		errMsg := fmt.Sprintf("Telegram respondió HTTP %d: %s", resp.StatusCode, safeBody)
 		t.mu.Lock()
 		t.lastError = errMsg
 		t.mu.Unlock()
 		logger.Log("[Telegram] ❌ %s", errMsg)
-		return fmt.Errorf("%s", errMsg)
+		return fmt.Errorf("Telegram respondió HTTP %d", resp.StatusCode)
 	}
 
 	t.mu.Lock()
@@ -109,11 +177,30 @@ func (t *TelegramNotifier) SendMessage(text string) error {
 	t.lastError = ""
 	t.mu.Unlock()
 
-	logger.Log("[Telegram] ✉️ Notificación enviada con éxito a chat %s.", chatID)
+	logger.Log("[Telegram] ✉️ Notificación enviada con éxito a chat %s.", maskSecret(chatID))
 	return nil
 }
 
+func (t *TelegramNotifier) shouldSendAlert(key string, cooldown time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lastAlerts == nil {
+		t.lastAlerts = make(map[string]time.Time)
+	}
+	last, ok := t.lastAlerts[key]
+	if ok && time.Since(last) < cooldown {
+		return false
+	}
+	t.lastAlerts[key] = time.Now()
+	return true
+}
+
 func (t *TelegramNotifier) SendSessionExpiredAlert(provider, phone, details string) error {
+	alertKey := fmt.Sprintf("session_expired:%s", phone)
+	if !t.shouldSendAlert(alertKey, 1*time.Hour) {
+		return nil
+	}
+
 	providerName := "Movistar Cloud"
 	if strings.EqualFold(provider, "o2") {
 		providerName = "O2 Cloud"
@@ -125,7 +212,7 @@ func (t *TelegramNotifier) SendSessionExpiredAlert(provider, phone, details stri
 			"Detalle: %s\n"+
 			"Hora: %s\n\n"+
 			"Por favor, abre el panel Web para revincular tu cuenta.",
-		providerName, phone, details, time.Now().Format("2006-01-02 15:04:05"),
+		providerName, maskSecret(phone), details, time.Now().Format("2006-01-02 15:04:05"),
 	)
 	return t.SendMessage(msg)
 }
@@ -154,7 +241,7 @@ func (t *TelegramNotifier) SendJobCompletedAlert(provider, phone string, total, 
 			"• Omitidos (ya en nube): %d\n"+
 			"• Errores: %d\n"+
 			"• Tiempo transcurrido: %s",
-		statusIcon, providerName, phone, total, uploaded, skipped, errorsCount, durationStr,
+		statusIcon, providerName, maskSecret(phone), total, uploaded, skipped, errorsCount, durationStr,
 	)
 	return t.SendMessage(msg)
 }

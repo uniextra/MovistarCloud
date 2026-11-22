@@ -2,15 +2,14 @@ package auth
 
 import (
 	"crypto/md5"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -23,11 +22,26 @@ const (
 	OAuthClientSecret = "e22fdd6b-636a-4bfc-bb4a-aa8ed6d131d8"
 	OAuthRedirectURI  = "https://micloud.movistar.es/ui/html/clientoauth.html"
 	ClientPlatform    = "windows"
-	DesktopUserAgent  = "omh windows client 32.0.7.1"
+	DesktopUserAgent  = "omh windows client 4.0.1"
 	SAPIBaseURL       = "https://micloud.movistar.es/sapi"
 )
 
+var (
+	oauthHTTPClient = &http.Client{Timeout: 30 * time.Second, Transport: NewFingerprintedTransport()}
+	sapiLoginClient = &http.Client{Timeout: 20 * time.Second, Transport: NewFingerprintedTransport()}
+)
+
+func GetDesktopUserAgent() string {
+	if value := strings.TrimSpace(os.Getenv("DESKTOP_USER_AGENT")); value != "" {
+		return value
+	}
+	return DesktopUserAgent
+}
+
 func GetOAuthAuthorizeURL(provider string) string {
+	if env := strings.TrimSpace(os.Getenv("OAUTH_AUTHORIZE_URL")); env != "" {
+		return env
+	}
 	if strings.EqualFold(provider, "o2") {
 		return "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/authorize"
 	}
@@ -35,6 +49,9 @@ func GetOAuthAuthorizeURL(provider string) string {
 }
 
 func GetOAuthTokenURL(provider string) string {
+	if env := strings.TrimSpace(os.Getenv("OAUTH_TOKEN_URL")); env != "" {
+		return env
+	}
 	if strings.EqualFold(provider, "o2") {
 		return "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/token"
 	}
@@ -42,6 +59,9 @@ func GetOAuthTokenURL(provider string) string {
 }
 
 func GetOAuthClientID(provider string) string {
+	if env := strings.TrimSpace(os.Getenv("OAUTH_CLIENT_ID")); env != "" {
+		return env
+	}
 	if strings.EqualFold(provider, "o2") {
 		return "21ce2068-4966-45dc-8b7f-a4a25a3a462f"
 	}
@@ -49,6 +69,9 @@ func GetOAuthClientID(provider string) string {
 }
 
 func GetOAuthClientSecret(provider string) string {
+	if env := strings.TrimSpace(os.Getenv("OAUTH_CLIENT_SECRET")); env != "" {
+		return env
+	}
 	if strings.EqualFold(provider, "o2") {
 		return "aa892341-04b1-4fd5-be41-db60d4e900e7"
 	}
@@ -113,9 +136,23 @@ type SAPILoginResult struct {
 	Error           error
 }
 
+func SanitizeDeviceID(devID string) string {
+	devID = strings.TrimSpace(devID)
+	if IsDesktopProfile() {
+		if devID == "" || strings.HasPrefix(devID, "fol-") {
+			return devID
+		}
+		return desktopDeviceIDFrom(devID)
+	}
+	return devID
+}
+
 func GenerateDeviceID() string {
+	if IsDesktopProfile() {
+		return generateDesktopDeviceID()
+	}
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	mustRandRead(b)
 	seed := fmt.Sprintf("PC+%x", b)
 	h := md5.Sum([]byte(seed))
 	b64 := base64.StdEncoding.EncodeToString(h[:])
@@ -124,7 +161,7 @@ func GenerateDeviceID() string {
 
 func GeneratePKCE() (verifier, challenge string) {
 	b := make([]byte, 32)
-	_, _ = rand.Read(b)
+	mustRandRead(b)
 	verifier = base64.RawURLEncoding.EncodeToString(b)
 	if len(verifier) > 64 {
 		verifier = verifier[:64]
@@ -138,8 +175,8 @@ func BuildOAuthLoginURL(provider string) (verifier, state, authURL string) {
 	verifier, challenge := GeneratePKCE()
 	stateB := make([]byte, 12)
 	nonceB := make([]byte, 12)
-	_, _ = rand.Read(stateB)
-	_, _ = rand.Read(nonceB)
+	mustRandRead(stateB)
+	mustRandRead(nonceB)
 	state = base64.RawURLEncoding.EncodeToString(stateB)
 	nonce := base64.RawURLEncoding.EncodeToString(nonceB)
 
@@ -203,22 +240,21 @@ func ExchangeCodeForTokens(code, verifier, provider string) (*OAuthTokens, error
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", clientID, clientSecret)))
 	req.Header.Set("Authorization", "Basic "+basicAuth)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
-	req.Header.Set("User-Agent", DesktopUserAgent)
+	req.Header.Set("User-Agent", GetDesktopUserAgent())
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OAuth token exchange failed (%d): %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("OAuth token exchange failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
 	}
 
 	var tokens OAuthTokens
@@ -228,48 +264,92 @@ func ExchangeCodeForTokens(code, verifier, provider string) (*OAuthTokens, error
 	return &tokens, nil
 }
 
-func RefreshOAuthToken(refreshToken, provider string) (*OAuthTokens, error) {
-	tokenURL := GetOAuthTokenURL(provider)
-	clientID := GetOAuthClientID(provider)
-	clientSecret := GetOAuthClientSecret(provider)
-
+func doRefreshOAuthTokenRequest(tokenURL, clientID, clientSecret, refreshToken string, includeBodyCreds bool) (*OAuthTokens, int, []byte, error) {
 	data := url.Values{}
 	data.Set("grant_type", "refresh_token")
 	data.Set("refresh_token", refreshToken)
-	data.Set("client_id", clientID)
-	data.Set("client_secret", clientSecret)
+	if includeBodyCreds {
+		data.Set("client_id", clientID)
+		data.Set("client_secret", clientSecret)
+	}
 
 	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, 0, nil, err
 	}
 
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", clientID, clientSecret)))
 	req.Header.Set("Authorization", "Basic "+basicAuth)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
-	req.Header.Set("User-Agent", DesktopUserAgent)
+	req.Header.Set("User-Agent", GetDesktopUserAgent())
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, err
+		return nil, resp.StatusCode, nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OAuth token refresh failed (%d): %s", resp.StatusCode, string(bodyBytes))
+		return nil, resp.StatusCode, bodyBytes, nil
 	}
 
 	var tokens OAuthTokens
 	if err := json.Unmarshal(bodyBytes, &tokens); err != nil {
-		return nil, err
+		return nil, resp.StatusCode, bodyBytes, err
 	}
-	return &tokens, nil
+	return &tokens, resp.StatusCode, bodyBytes, nil
+}
+
+func RefreshOAuthToken(refreshToken, provider string) (*OAuthTokens, error) {
+	tokenURL := GetOAuthTokenURL(provider)
+	clientID := GetOAuthClientID(provider)
+	clientSecret := GetOAuthClientSecret(provider)
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			oauthHTTPClient.CloseIdleConnections()
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		// Conforme a RFC 6749 §2.3.1, enviamos primero solo Authorization: Basic
+		tokens, statusCode, bodyBytes, err := doRefreshOAuthTokenRequest(tokenURL, clientID, clientSecret, refreshToken, false)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if statusCode == http.StatusOK && tokens != nil {
+			return tokens, nil
+		}
+
+		// Fallback de compatibilidad incluyendo client_id y client_secret en el cuerpo si no fue 429
+		if statusCode >= 400 && statusCode != http.StatusTooManyRequests {
+			tokens2, statusCode2, bodyBytes2, err2 := doRefreshOAuthTokenRequest(tokenURL, clientID, clientSecret, refreshToken, true)
+			if err2 != nil {
+				lastErr = err2
+				continue
+			}
+			if statusCode2 == http.StatusOK && tokens2 != nil {
+				return tokens2, nil
+			}
+			statusCode = statusCode2
+			bodyBytes = bodyBytes2
+		}
+
+		// Si es un error terminal (400/401 invalid_grant / revoked token), no seguir reintentando
+		if statusCode == http.StatusBadRequest || statusCode == http.StatusUnauthorized {
+			return nil, fmt.Errorf("OAuth token refresh rejected (HTTP %d): %s", statusCode, strings.TrimSpace(string(bodyBytes)))
+		}
+
+		lastErr = fmt.Errorf("OAuth token refresh failed (HTTP %d): %s", statusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	return nil, lastErr
 }
 
 func BuildOAuthHeader(accessToken, refreshToken string, lastRefreshDate int64, expiresIn string) string {
@@ -364,7 +444,7 @@ func ParseOAuthResponseHeader(headerVal string) *RotatedOAuth {
 
 func SAPILoginOAuth(client *http.Client, sapiBaseURL, accessToken, refreshToken, deviceID, deviceName string, lastRefreshDate int64, expiresIn string) SAPILoginResult {
 	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second}
+		client = sapiLoginClient
 	}
 
 	endpoint := sapiBaseURL
@@ -374,95 +454,131 @@ func SAPILoginOAuth(client *http.Client, sapiBaseURL, accessToken, refreshToken,
 	endpoint = strings.TrimSuffix(endpoint, "/")
 
 	targetURL := fmt.Sprintf("%s/login/oauth?action=login&responsetime=true", endpoint)
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		return SAPILoginResult{Error: err}
-	}
-
 	authHeader := BuildOAuthHeader(accessToken, refreshToken, lastRefreshDate, expiresIn)
-	req.Header.Set("Authorization", authHeader)
-	req.Header.Set("User-Agent", DesktopUserAgent)
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	if deviceID != "" {
-		req.Header.Set("X-deviceid", deviceID)
-	}
-	if deviceName != "" {
-		req.Header.Set("X-devicename", deviceName)
-	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return SAPILoginResult{Error: err}
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return SAPILoginResult{StatusCode: resp.StatusCode, Error: err}
-	}
-
-	result := SAPILoginResult{
-		StatusCode:  resp.StatusCode,
-		RawResponse: string(bodyBytes),
-	}
-
-	// 1. Extraer cabecera Authorization rotada si existe
-	if authResp := resp.Header.Get("Authorization"); authResp != "" {
-		result.RefreshedOAuth = ParseOAuthResponseHeader(authResp)
-	}
-
-	// 2. Extraer cookies de sesión
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "validationkey" {
-			result.ValidationKey = cookie.Value
-		} else if cookie.Name == "JSESSIONID" {
-			result.JSessionID = cookie.Value
+	var lastRes SAPILoginResult
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			client.CloseIdleConnections()
+			time.Sleep(time.Duration(attempt) * time.Second)
 		}
-	}
 
-	// 3. Parsear JSON body
-	var bodyMap map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &bodyMap); err == nil {
-		findKey := func(keys ...string) string {
-			for _, k := range keys {
-				if v, ok := bodyMap[k]; ok && v != nil {
-					if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" && s != "<nil>" {
-						return s
-					}
+		req, err := http.NewRequest("GET", targetURL, nil)
+		if err != nil {
+			return SAPILoginResult{Error: err}
+		}
+
+		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("User-Agent", GetDesktopUserAgent())
+		req.Header.Set("Accept", "*/*")
+		if IsDesktopProfile() {
+			req.Header.Set("Accept-Language", DesktopAcceptLanguage)
+			req.Header.Set("x-request-id", NewRequestID())
+			if deviceID != "" {
+				req.Header.Set("X-deviceid", SanitizeDeviceID(deviceID))
+			}
+		} else {
+			req.Header.Set("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
+			if deviceID != "" {
+				req.Header.Set("X-deviceid", SanitizeDeviceID(deviceID))
+			}
+			if deviceName != "" {
+				req.Header.Set("X-devicename", deviceName)
+			}
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastRes = SAPILoginResult{Error: err}
+			continue
+		}
+
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if err != nil {
+			lastRes = SAPILoginResult{StatusCode: resp.StatusCode, Error: err}
+			continue
+		}
+
+		result := SAPILoginResult{
+			StatusCode:  resp.StatusCode,
+			RawResponse: string(bodyBytes),
+		}
+
+		// 1. Extraer cabecera Authorization rotada si existe
+		for _, h := range []string{"Authorization", "WWW-Authenticate", "Authentication-Info"} {
+			if authResp := resp.Header.Get(h); authResp != "" {
+				if rot := ParseOAuthResponseHeader(authResp); rot != nil {
+					result.RefreshedOAuth = rot
+					break
 				}
-				if dataMap, ok := bodyMap["data"].(map[string]interface{}); ok {
-					if v, ok := dataMap[k]; ok && v != nil {
+			}
+		}
+
+		// 2. Extraer cookies de sesión (solo con código < 400)
+		if resp.StatusCode < 400 {
+			for _, cookie := range resp.Cookies() {
+				if strings.EqualFold(cookie.Name, "validationkey") {
+					result.ValidationKey = cookie.Value
+				} else if strings.EqualFold(cookie.Name, "JSESSIONID") {
+					result.JSessionID = cookie.Value
+				}
+			}
+		}
+
+		// 3. Parsear JSON body
+		var bodyMap map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &bodyMap); err == nil {
+			findKey := func(keys ...string) string {
+				for _, k := range keys {
+					if v, ok := bodyMap[k]; ok && v != nil {
 						if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" && s != "<nil>" {
 							return s
 						}
 					}
+					if dataMap, ok := bodyMap["data"].(map[string]interface{}); ok {
+						if v, ok := dataMap[k]; ok && v != nil {
+							if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" && s != "<nil>" {
+								return s
+							}
+						}
+					}
+				}
+				return ""
+			}
+
+			if result.ValidationKey == "" {
+				result.ValidationKey = findKey("validationkey", "validationKey", "ValidationKey")
+			}
+			if result.JSessionID == "" {
+				result.JSessionID = findKey("jsessionid", "jsessionId", "JSessionID", "sessionId", "sessionid")
+			}
+
+			if rt := findKey("responsetime", "responseTime", "lastrefreshdate", "lastRefreshDate"); rt != "" {
+				var lrd int64
+				fmt.Sscanf(rt, "%d", &lrd)
+				if lrd > 0 {
+					if lrd < 100000000000 {
+						lrd = lrd * 1000
+					}
+					result.LastRefreshDate = lrd
 				}
 			}
-			return ""
 		}
 
-		if result.ValidationKey == "" {
-			result.ValidationKey = findKey("validationkey", "validationKey", "ValidationKey")
-		}
-		if result.JSessionID == "" {
-			result.JSessionID = findKey("jsessionid", "jsessionId", "JSessionID", "sessionId", "sessionid")
+		if result.StatusCode == http.StatusOK {
+			return result
 		}
 
-		if rt := findKey("responsetime", "responseTime", "lastrefreshdate", "lastRefreshDate"); rt != "" {
-			var lrd int64
-			fmt.Sscanf(rt, "%d", &lrd)
-			if lrd > 0 {
-				if lrd < 100000000000 {
-					lrd = lrd * 1000
-				}
-				result.LastRefreshDate = lrd
-			}
+		// Si el error no es transitorio (ej. 401 definitivo sin tokens), no tiene sentido repetir 3 veces
+		if result.StatusCode == http.StatusUnauthorized || result.StatusCode == http.StatusForbidden {
+			result.Error = fmt.Errorf("SAPI login returned HTTP %d", result.StatusCode)
+			return result
 		}
+
+		result.Error = fmt.Errorf("SAPI login returned HTTP %d", result.StatusCode)
+		lastRes = result
 	}
 
-	if result.StatusCode != http.StatusOK {
-		result.Error = errors.New(fmt.Sprintf("SAPI login returned HTTP %d", result.StatusCode))
-	}
-
-	return result
+	return lastRes
 }
